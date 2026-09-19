@@ -160,12 +160,78 @@ cambio.**
 
 ---
 
+## El proxy de costo
+
+`proxy.py` se para entre el front y el agente. Azure **no tiene un freno duro por
+dólares** —los presupuestos de Cost Management avisan, no detienen— así que el
+tope real se arma aquí, en cuatro capas:
+
+| Capa | Qué ataja |
+|---|---|
+| Límite por IP | Un script que dispara cientos de consultas |
+| Caché | La repetición, que en una herramienta pública es la mayoría del tráfico |
+| Presupuesto diario | El freno duro. Si el día se agota, no se llama al modelo |
+| Preguntas libres | Cuándo se pide registro |
+
+El orden importa. El límite por IP va primero porque un script vacía el
+presupuesto antes de que la caché se caliente. La caché va antes que la cuota
+porque una respuesta guardada no cuesta nada y no tiene por qué gastarle a nadie
+una de sus preguntas libres.
+
+### Cuánto puede gastar como máximo
+
+De los **USD 300** mensuales reparte **8,50 al día** y solo usa el **85 %**: el
+techo real son **USD 255 en 30 días**. El margen que queda permite que las
+respuestas en caché y los mensajes de error sigan funcionando cuando el día se
+agota.
+
+```bash
+export BRUJULA_PRESUPUESTO_MENSUAL_USD=300
+export BRUJULA_USD_POR_MILLON_ENTRADA=3
+export BRUJULA_USD_POR_MILLON_SALIDA=15
+export BRUJULA_PREGUNTAS_LIBRES=10
+export BRUJULA_LIMITE_IP_HORA=30
+export BRUJULA_CACHE_DIAS=7
+```
+
+**Las tarifas por millón de tokens son el único punto donde el proxy traduce
+consumo a dinero.** Si el modelo cambia y esas cifras se quedan viejas, el tope
+queda mal calculado sin que nada lo avise. Revisarlas al cambiar de modelo.
+
+### Contadores compartidos
+
+Con `AZURE_STORAGE_CONNECTION_STRING` definida, los contadores van a Table
+Storage en `stbrujulastartin`. Sin ella, quedan en memoria y el proxy **lo avisa
+en el log**: con varias réplicas, cada una llevaría su propio tope de 8,50
+diarios y el límite se multiplicaría en silencio.
+
+El contador del día está **repartido en 16 filas**, y no por gusto. Cada petición
+suma al gasto del mismo día, así que con una sola fila todas las réplicas se
+pisan entre sí. Medido con ocho hilos y 200 sumas: **478 conflictos de versión, y
+se perdía el 28 % del gasto**. Repartido en fragmentos bajó a 22 conflictos y el
+total quedó exacto. Un contador que pierde gasto no frena nada.
+
+### Falla cerrado
+
+Si Table Storage no responde, el proxy **no deja pasar la petición**. Un contador
+caído significa que no sabemos cuánto llevamos gastado, y gastar sin saber es
+justo lo que este componente existe para impedir. Está probado.
+
+```bash
+python probar_proxy.py    # incluye la prueba de concurrencia
+```
+
+Corre sin credenciales ni SDK de Azure: usa una tabla simulada que reproduce los
+conflictos de versión. Un almacén que solo se puede probar contra el servicio
+real termina sin probarse.
+
+---
+
 ## Lo que falta
 
 - **Desplegar el servidor MCP.** `server.py` está probado pero todavía no está
   en Container Apps: hoy solo corre local.
-- **El proxy con tope de costo.** Sin él, el agente queda expuesto a que el uso
-  dispare la factura de tokens.
+- **Desplegar el proxy.** El código está probado pero todavía no está en pie.
 - **El front y el dominio** `brujula.startinlab.org` (DNS en Hostinger).
 - **La programación mensual.** Hoy la ingesta se arranca a mano.
 - **TerriData del DNP**, que es descarga de archivo, no API.

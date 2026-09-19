@@ -47,6 +47,142 @@ class AlmacenRoto(P.AlmacenMemoria):
         raise RuntimeError("almacén no disponible")
 
 
+# --------------------------------------------------------------------------- #
+# Tabla falsa: imita Azure Table Storage, incluidos los conflictos de ETag
+# --------------------------------------------------------------------------- #
+
+import random  # noqa: E402
+import threading  # noqa: E402
+
+
+class TablaFalsa:
+    """
+    Imita lo justo de Azure Table Storage para probar la concurrencia: entidades
+    con ETag, y una escritura condicional que FALLA si el ETag cambió.
+
+    El `sleep` aleatorio entre la lectura y la escritura no es adorno: sin él,
+    los hilos casi nunca se solapan y la prueba pasaría aunque el código
+    estuviera mal. Ensancha a propósito la ventana donde se pierde una
+    actualización.
+    """
+
+    def __init__(self) -> None:
+        self.filas: dict[tuple[str, str], dict] = {}
+        self._lock = threading.Lock()
+        self.conflictos = 0
+
+    def get_entity(self, particion, clave):  # noqa: ANN001, ANN201
+        with self._lock:
+            fila = self.filas.get((particion, clave))
+            if fila is None:
+                raise LookupError("ResourceNotFoundError: no existe")
+            return dict(fila)
+
+    def create_entity(self, entidad):  # noqa: ANN001, ANN201
+        with self._lock:
+            k = (entidad["PartitionKey"], entidad["RowKey"])
+            if k in self.filas:
+                raise ValueError("ResourceExistsError: ya existe")
+            self.filas[k] = {**entidad, "etag": "v1"}
+
+    def update_entity(self, entidad, mode=None, etag=None, match_condition=None):  # noqa: ANN001, ANN201, ARG002
+        time.sleep(random.uniform(0, 0.004))   # ensancha la ventana de carrera
+        with self._lock:
+            k = (entidad["PartitionKey"], entidad["RowKey"])
+            actual = self.filas.get(k)
+            if actual is None:
+                raise LookupError("ResourceNotFoundError: no existe")
+            if etag is not None and actual["etag"] != etag:
+                self.conflictos += 1
+                raise RuntimeError("ResourceModifiedError 412: el ETag cambió")
+            version = int(actual["etag"][1:]) + 1
+            self.filas[k] = {**entidad, "etag": f"v{version}"}
+
+    def query_entities(self, filtro):  # noqa: ANN001, ANN201
+        """Solo entiende el filtro que usa el proxy: partición + rango de RowKey."""
+        import re as _re
+        m = _re.search(r"PartitionKey eq '([^']+)'", filtro)
+        desde = _re.search(r"RowKey ge '([^']+)'", filtro)
+        hasta = _re.search(r"RowKey le '([^']+)'", filtro)
+        with self._lock:
+            return [dict(f) for (pk, rk), f in self.filas.items()
+                    if (not m or pk == m.group(1))
+                    and (not desde or rk >= desde.group(1))
+                    and (not hasta or rk <= hasta.group(1))]
+
+    def upsert_entity(self, entidad):  # noqa: ANN001, ANN201
+        with self._lock:
+            k = (entidad["PartitionKey"], entidad["RowKey"])
+            version = int(self.filas.get(k, {}).get("etag", "v0")[1:]) + 1
+            self.filas[k] = {**entidad, "etag": f"v{version}"}
+
+
+def probar_almacen_compartido() -> None:
+    print("\n== 10. Almacén compartido: no se pierden actualizaciones ==")
+    tabla = TablaFalsa()
+    almacen = P.AlmacenTablas(cliente_tabla=tabla)
+
+    check("arranca en cero", almacen.gasto_del_dia("2026-09-19") == 0.0)
+    almacen.sumar_gasto("2026-09-19", 1.25)
+    check("suma sobre una fila nueva", almacen.gasto_del_dia("2026-09-19") == 1.25)
+    almacen.sumar_gasto("2026-09-19", 0.75)
+    check("suma sobre una fila existente", almacen.gasto_del_dia("2026-09-19") == 2.0)
+
+    # Lo que de verdad importa: varias réplicas sumando a la vez.
+    HILOS, POR_HILO, MONTO = 8, 25, 0.01
+    errores: list[Exception] = []
+
+    def replica() -> None:
+        for _ in range(POR_HILO):
+            try:
+                almacen.sumar_gasto("2026-09-20", MONTO)
+            except Exception as exc:  # noqa: BLE001
+                errores.append(exc)
+
+    hilos = [threading.Thread(target=replica) for _ in range(HILOS)]
+    for h in hilos:
+        h.start()
+    for h in hilos:
+        h.join()
+
+    esperado = HILOS * POR_HILO * MONTO
+    obtenido = almacen.gasto_del_dia("2026-09-20")
+    check(f"{HILOS} réplicas x {POR_HILO} sumas sin errores", not errores,
+          errores[:1])
+    check(f"el total es exacto ({esperado:.2f})", abs(obtenido - esperado) < 1e-9,
+          f"obtenido {obtenido:.4f}")
+    print(f"      {tabla.conflictos} conflictos de ETag (con fila única eran 478)")
+    check("fragmentar bajó la contención drásticamente", tabla.conflictos < 100,
+          tabla.conflictos)
+
+    print("\n== 11. La caché respeta el límite de tamaño ==")
+    almacen.guardar_cache("chica", {"dato": "x" * 100})
+    check("una respuesta pequeña se cachea", almacen.leer_cache("chica") is not None)
+    almacen.guardar_cache("grande", {"dato": "x" * (P.AlmacenTablas.LIMITE_CACHE_BYTES + 1000)})
+    check("una respuesta enorme NO se cachea, en vez de truncarse",
+          almacen.leer_cache("grande") is None)
+
+    print("\n== 12. El límite por IP funciona por hora ==")
+    for _ in range(3):
+        almacen.registrar_peticion("190.85.1.1")
+    check("cuenta las peticiones de esa IP", almacen.peticiones_recientes("190.85.1.1", 3600) == 3)
+    check("otra IP no se ve afectada", almacen.peticiones_recientes("190.85.1.2", 3600) == 0)
+    almacen.registrar_peticion("2800:e2:1::5")
+    check("una IPv6 no rompe la clave de la tabla",
+          almacen.peticiones_recientes("2800:e2:1::5", 3600) == 1)
+
+    print("\n== 13. Si la tabla se cae, el Portero falla cerrado ==")
+    class TablaCaida(TablaFalsa):
+        def get_entity(self, particion, clave):  # noqa: ANN001, ANN201
+            raise RuntimeError("el servicio no responde")
+
+    portero = P.Portero(almacen=P.AlmacenTablas(cliente_tabla=TablaCaida()),
+                        presupuesto_diario_usd=100.0)
+    v = portero.evaluar("algo", "1.1.1.1", "v", "META", "Villavicencio")
+    check("no deja pasar la petición", not v.permitir, v.motivo)
+    check("responde 503", v.codigo == 503)
+
+
 def main() -> int:
     print("== 1. El presupuesto diario corta ==")
     p = P.Portero(presupuesto_diario_usd=1.00)
@@ -160,6 +296,10 @@ def main() -> int:
           techo_mes <= P.PRESUPUESTO_MENSUAL_USD, round(techo_mes, 2))
     print(f"      gasto máximo posible en 30 días: USD {techo_mes:.2f} "
           f"de un tope de {P.PRESUPUESTO_MENSUAL_USD:.0f}")
+
+
+
+    probar_almacen_compartido()
 
     print("\n" + "=" * 64)
     if FALLOS:

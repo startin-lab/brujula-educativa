@@ -51,6 +51,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 import unicodedata
@@ -206,6 +207,226 @@ class AlmacenMemoria:
 
 
 # --------------------------------------------------------------------------- #
+# Almacén compartido (Azure Table Storage)
+# --------------------------------------------------------------------------- #
+
+class ConflictoDeVersion(Exception):
+    """Otra réplica escribió primero. Hay que releer y reintentar."""
+
+
+# El SDK de Azure se importa si está; si no, se usan equivalentes inertes.
+#
+# No es un capricho: las pruebas de concurrencia —las únicas que demuestran que
+# el contador de gasto no pierde sumas— tienen que poder correr en cualquier
+# máquina y en CI, sin credenciales ni paquetes de nube. Un almacén que solo se
+# puede probar contra el servicio real termina sin probarse.
+try:
+    from azure.core import MatchConditions as _MatchConditions
+    from azure.data.tables import UpdateMode as _UpdateMode
+    _SDK_AZURE = True
+except ImportError:  # pragma: no cover
+    class _MatchConditions:  # type: ignore[no-redef]
+        IfNotModified = "IfNotModified"
+
+    class _UpdateMode:  # type: ignore[no-redef]
+        REPLACE = "replace"
+
+    _SDK_AZURE = False
+
+
+class AlmacenTablas:
+    """
+    Contadores compartidos entre réplicas, sobre Azure Table Storage.
+
+    POR QUÉ NO BASTA CON GUARDAR EN ALGÚN LADO
+
+      El problema de un contador de gasto repartido no es la persistencia: es la
+      concurrencia. Dos réplicas que atienden una petición cada una leen «llevo
+      3,00 USD», suman lo suyo y escriben. La segunda pisa a la primera y uno de
+      los dos gastos DESAPARECE del contador. Con suficiente tráfico —que es
+      justo cuando el tope importa— el contador se queda muy por debajo del
+      gasto real y el freno nunca salta.
+
+      La solución es la actualización condicional: se lee el valor con su ETag y
+      se escribe exigiendo que el ETag no haya cambiado. Si cambió, otra réplica
+      llegó primero, y hay que releer y volver a intentar. Es lo que hace
+      `_sumar_atomico`, y es la única parte de este archivo donde un error
+      silencioso cuesta dinero de verdad.
+
+    LÍMITE QUE HAY QUE CONOCER
+
+      Una entidad de Table Storage admite 64 KB por propiedad y 1 MB en total.
+      Una respuesta del agente con varias visualizaciones puede pasarse. Cuando
+      eso ocurre NO se cachea y se anota: es preferible pagar esa respuesta cada
+      vez a inventar un truncamiento que devuelva datos incompletos.
+    """
+
+    LIMITE_CACHE_BYTES = 60_000
+    REINTENTOS_ESCRITURA = 8
+
+    # El contador del día se reparte en varias filas.
+    #
+    # POR QUÉ NO BASTA CON REINTENTAR. Cada petición suma al gasto del mismo
+    # día: con varias réplicas, todas escriben en la MISMA fila y se pisan entre
+    # sí. Medido con ocho hilos y 200 sumas sobre una sola fila: 478 conflictos
+    # de ETag, y con reintentos a secas algunos hilos se rinden y se pierde el
+    # 28 % del gasto. Un contador que pierde gasto no frena nada.
+    #
+    # Repartir el contador en FRAGMENTOS quita la contención de raíz: cada
+    # escritura cae en una fila al azar, así que dos réplicas casi nunca compiten
+    # por la misma. Leer cuesta una consulta por rango en vez de una lectura
+    # puntual, que es un precio bajo por un contador que no miente.
+    FRAGMENTOS = 16
+
+    def __init__(self, cliente_tabla=None, cadena_conexion: str | None = None,
+                 prefijo: str = "brujula") -> None:
+        if cliente_tabla is not None:
+            self._tabla = cliente_tabla
+            return
+        if not _SDK_AZURE:
+            raise RuntimeError("Falta azure-data-tables: pip install azure-data-tables")
+        from azure.data.tables import TableServiceClient  # noqa: PLC0415
+
+        cadena = cadena_conexion or os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
+        if not cadena:
+            raise RuntimeError(
+                "AlmacenTablas necesita AZURE_STORAGE_CONNECTION_STRING. "
+                "Sin almacén compartido, cada réplica llevaría su propio tope."
+            )
+        servicio = TableServiceClient.from_connection_string(cadena)
+        nombre = f"{prefijo}contadores"
+        try:
+            servicio.create_table(nombre)
+        except Exception:  # noqa: BLE001
+            pass  # ya existía
+        self._tabla = servicio.get_table_client(nombre)
+
+    # -- primitivas ------------------------------------------------------- #
+
+    @staticmethod
+    def _es(exc: Exception, *marcas: str) -> bool:
+        """
+        Reconoce el tipo de error mirando el nombre de la clase Y el mensaje.
+
+        El SDK de Azure lanza `ResourceNotFoundError`; una tabla simulada o una
+        versión distinta del SDK pueden lanzar otra cosa con el mismo sentido.
+        Mirar solo el nombre de la clase haría que un «no existe» se propagara
+        como error real y el proxy respondiera 503 con la tabla sana.
+        """
+        texto = f"{type(exc).__name__} {exc}"
+        return any(m in texto for m in marcas)
+
+    def _leer(self, particion: str, clave: str) -> dict | None:
+        try:
+            return dict(self._tabla.get_entity(particion, clave))
+        except Exception as exc:  # noqa: BLE001
+            if self._es(exc, "ResourceNotFound", "404", "no existe"):
+                return None
+            raise
+
+    def _sumar_atomico(self, particion: str, clave: str, campo: str, delta: float) -> float:
+        """
+        Suma sin perder actualizaciones. Relee y reintenta mientras otra réplica
+        vaya ganando la carrera; si tras varios intentos no lo logra, LANZA en
+        vez de escribir a ciegas. Un contador que miente es peor que uno que
+        falla: el que falla hace que el proxy responda 503 y no gaste.
+        """
+        for intento in range(self.REINTENTOS_ESCRITURA):
+            if intento:
+                # Espera creciente con ruido: sin el ruido, las réplicas que
+                # chocaron vuelven a chocar todas juntas en el mismo instante.
+                time.sleep(random.uniform(0, 0.02 * (2 ** min(intento, 5))))
+            actual = self._leer(particion, clave)
+            if actual is None:
+                nueva = {"PartitionKey": particion, "RowKey": clave, campo: delta}
+                try:
+                    self._tabla.create_entity(nueva)
+                    return float(delta)
+                except Exception as exc:  # noqa: BLE001
+                    if self._es(exc, "ResourceExists", "409", "ya existe"):
+                        continue   # otra réplica la creó primero; releer
+                    raise
+            valor = float(actual.get(campo, 0.0)) + delta
+            actual[campo] = valor
+            try:
+                self._tabla.update_entity(
+                    actual, mode=_UpdateMode.REPLACE,
+                    etag=actual.get("etag") or actual.get("odata.etag"),
+                    match_condition=_MatchConditions.IfNotModified,
+                )
+                return valor
+            except ConflictoDeVersion:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if self._es(exc, "ResourceModified", "412"):
+                    continue   # otra réplica ganó la carrera: releer y reintentar
+                raise
+        raise RuntimeError(
+            f"No se pudo actualizar {particion}/{clave} tras "
+            f"{self.REINTENTOS_ESCRITURA} intentos: demasiada concurrencia."
+        )
+
+    # -- interfaz que usa el Portero -------------------------------------- #
+
+    def gasto_del_dia(self, dia: str) -> float:
+        """Suma de todos los fragmentos del día, en una sola consulta por rango."""
+        filtro = (f"PartitionKey eq 'gasto' and RowKey ge '{dia}-00' "
+                  f"and RowKey le '{dia}-99'")
+        total = 0.0
+        for fila in self._tabla.query_entities(filtro):
+            total += float(dict(fila).get("usd", 0.0))
+        return total
+
+    def sumar_gasto(self, dia: str, usd: float) -> None:
+        fragmento = random.randrange(self.FRAGMENTOS)
+        self._sumar_atomico("gasto", f"{dia}-{fragmento:02d}", "usd", usd)
+
+    def peticiones_recientes(self, ip: str, ventana_s: int) -> int:
+        # Se cuenta por hora en vez de guardar una lista de marcas de tiempo:
+        # una fila por IP y hora, que además caduca sola al cambiar la hora.
+        fila = self._leer("ip", self._clave_hora(ip))
+        return int(fila.get("n", 0)) if fila else 0
+
+    def registrar_peticion(self, ip: str) -> None:
+        self._sumar_atomico("ip", self._clave_hora(ip), "n", 1)
+
+    def preguntas_usadas(self, visitante: str) -> int:
+        fila = self._leer("visitante", visitante)
+        return int(fila.get("n", 0)) if fila else 0
+
+    def sumar_pregunta(self, visitante: str) -> None:
+        self._sumar_atomico("visitante", visitante, "n", 1)
+
+    def leer_cache(self, clave: str) -> dict | None:
+        fila = self._leer("cache", clave)
+        if not fila:
+            return None
+        if time.time() - float(fila.get("guardado", 0)) > CACHE_DIAS * 86400:
+            return None
+        try:
+            return json.loads(fila["json"])
+        except (KeyError, ValueError):
+            return None
+
+    def guardar_cache(self, clave: str, respuesta: dict) -> None:
+        texto = json.dumps(respuesta, ensure_ascii=False)
+        if len(texto.encode("utf-8")) > self.LIMITE_CACHE_BYTES:
+            LOG.info("Respuesta de %s bytes: no se cachea (límite de Table Storage). "
+                     "Se pagará cada vez.", len(texto))
+            return
+        self._tabla.upsert_entity({
+            "PartitionKey": "cache", "RowKey": clave,
+            "json": texto, "guardado": time.time(),
+        })
+
+    @staticmethod
+    def _clave_hora(ip: str) -> str:
+        # La IP va sanitizada: ':' y '/' no son válidos en una RowKey.
+        limpia = re.sub(r"[^A-Za-z0-9._-]", "_", ip)
+        return f"{limpia}-{datetime.now(timezone.utc):%Y%m%d%H}"
+
+
+# --------------------------------------------------------------------------- #
 # Portero
 # --------------------------------------------------------------------------- #
 
@@ -331,7 +552,26 @@ class Portero:
 
 # --------------------------------------------------------------------------- #
 
+def construir_portero() -> Portero:
+    """
+    Table Storage si hay cómo; memoria si no, avisando fuerte.
+
+    El aviso importa: con contadores en memoria y varias réplicas, el tope
+    diario se multiplica por el número de réplicas sin que nada lo indique.
+    """
+    if os.environ.get("AZURE_STORAGE_CONNECTION_STRING"):
+        try:
+            return Portero(almacen=AlmacenTablas())
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("No se pudo usar Table Storage (%s). Se sigue en memoria.", exc)
+    LOG.warning(
+        "CONTADORES EN MEMORIA. Válido para una sola instancia. Con varias "
+        "réplicas cada una llevaría su propio tope y el límite de gasto se "
+        "multiplicaría en silencio."
+    )
+    return Portero()
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
-    p = Portero()
-    print(json.dumps(p.estado(), ensure_ascii=False, indent=2))
+    print(json.dumps(construir_portero().estado(), ensure_ascii=False, indent=2))
