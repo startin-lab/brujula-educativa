@@ -1,7 +1,3 @@
-def x():
-    if True:
-        return 1
-    return 0
 #!/usr/bin/env python3
 """
 Brújula Educativa — Ingesta de resultados agregados Saber 11 (ICFES)
