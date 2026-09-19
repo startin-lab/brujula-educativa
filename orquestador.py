@@ -66,6 +66,12 @@ TOKEN_NACIONAL = os.environ.get("BRUJULA_TOKEN_NACIONAL", "")
 # gaste el presupuesto del día en una sola pregunta.
 MAX_VUELTAS = int(os.environ.get("BRUJULA_MAX_VUELTAS", "6"))
 
+# Familias de modelo que rechazan `temperature`. Se detecta por el nombre del
+# despliegue, que es lo único que conocemos aquí.
+_SIN_TEMPERATURA = any(
+    marca in MODELO.lower() for marca in ("claude", "opus", "sonnet", "haiku")
+)
+
 INSTRUCCIONES = """\
 Eres Brújula Educativa, de la Fundación Startin. Respondes preguntas sobre
 educación en Colombia usando únicamente datos abiertos oficiales.
@@ -75,8 +81,9 @@ CÓMO TRABAJAS
 - Todo diagnóstico es territorial. Nunca respondas «sobre el país» salvo que
   te lo pidan con acceso completo. Si no sabes de qué municipio o departamento
   hablan, pregúntalo antes de consultar.
-- Usa las herramientas para obtener los datos. No inventes cifras, no las
-  estimes, no las recuerdes de otra parte. Si una herramienta no trae un dato,
+- Usa las herramientas SIEMPRE, incluso si crees saber la respuesta. Ninguna
+  cifra sale de tu memoria: toda cifra viene de una herramienta de esta sesión.
+  No inventes, no estimes, no redondees de cabeza. Si una herramienta no trae un dato,
   di que no está publicado.
 - Cuando una herramienta devuelva advertencias, incorpóralas a tu respuesta en
   lenguaje llano. Son el contexto sin el cual la cifra engaña.
@@ -240,11 +247,17 @@ async def responder(pregunta: str, departamento: str, municipio: str,
     entrada = salida = 0
 
     for vuelta in range(MAX_VUELTAS):
+        # `temperature` se manda solo si el modelo la acepta. Los modelos
+        # Claude en Foundry NO admiten `temperature` ni `top_k`, y mandarla
+        # hace fallar la llamada entera. Como la elección de modelo es una
+        # variable de entorno, el código tiene que aguantar las dos familias
+        # sin que nadie recuerde editarlo el día del cambio.
+        extra = {} if _SIN_TEMPERATURA else {"temperature": 0}
         respuesta = modelo.chat.completions.create(
             model=MODELO,
             messages=mensajes,
             tools=herramientas.catalogo,
-            temperature=0,          # cifras, no prosa creativa
+            **extra,
         )
         uso = getattr(respuesta, "usage", None)
         if uso:
