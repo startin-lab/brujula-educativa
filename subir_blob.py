@@ -149,6 +149,9 @@ def main() -> int:
     parser.add_argument("--contenedor", default="datos")
     parser.add_argument("--forzar", action="store_true",
                         help="Actualiza 'actual/' aunque falle la validación")
+    parser.add_argument("--consultar", action="store_true",
+                        help="No sube nada: imprime la fecha y la edad en días "
+                             "del corte vigente, y termina")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
@@ -171,7 +174,7 @@ def main() -> int:
         return 1
 
     archivos = sorted(args.datos.glob("*.parquet")) + sorted(args.datos.glob("*.json"))
-    if not archivos:
+    if not archivos and not args.consultar:
         LOG.error("No hay nada que subir en %s", args.datos)
         return 1
 
@@ -184,6 +187,22 @@ def main() -> int:
         LOG.info("Contenedor %s creado", args.contenedor)
     except Exception:  # noqa: BLE001
         pass  # ya existía
+
+    if args.consultar:
+        # Lo usa correr_ingesta.sh para decidir si hay algo que hacer hoy. Se
+        # imprime en una sola línea legible por `read` en bash.
+        vigente = manifiesto_anterior(contenedor)
+        fecha = vigente.get("corte", "")
+        if fecha:
+            try:
+                dias = (datetime.now(timezone.utc).date()
+                        - datetime.strptime(fecha, "%Y-%m-%d").date()).days
+            except ValueError:
+                fecha, dias = "ilegible", 9999
+        else:
+            fecha, dias = "ninguno", 9999
+        print(f"corte={fecha} dias={dias}")
+        return 0
 
     previo = manifiesto_anterior(contenedor)
     if previo:

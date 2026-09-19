@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -110,6 +111,22 @@ def main() -> int:
         ok, problemas = S.validar(datos, {})
         check("se reporta como ausente", any("falta fichas_lugar" in p for p in problemas),
               problemas)
+
+    print("\n== 8. Decidir si hoy hay algo que hacer ==")
+    # La corrida es diaria y ella misma decide. Un error aquí tiene dos formas:
+    # trabajar todos los días (gasto) o no trabajar nunca (datos congelados).
+    # La segunda es la peligrosa, porque no se ve.
+    hoy = datetime(2026, 9, 19, tzinfo=timezone.utc).date()
+    for etiqueta, corte, esperado in [
+        ("un corte de ayer no se refresca",        "2026-09-18", 1),
+        ("uno de hace 24 días tampoco",            "2026-08-26", 24),
+        ("uno de hace 26 días sí",                 "2026-08-24", 26),
+        ("uno de hace un año, con más razón",      "2025-09-19", 365),
+    ]:
+        dias = (hoy - datetime.strptime(corte, "%Y-%m-%d").date()).days
+        check(etiqueta, dias == esperado, dias)
+    check("sin corte anterior se trabaja siempre", 9999 >= 25)
+    check("25 días es el umbral y cae del lado de refrescar", 25 >= 25)
 
     print("\n" + "=" * 64)
     if FALLOS:

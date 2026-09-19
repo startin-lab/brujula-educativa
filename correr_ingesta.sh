@@ -24,6 +24,19 @@
 #   REPO                              (opcional) repositorio de origen
 #   SALTAR                            (opcional) pasos a omitir, separados por coma
 #                                     ej: SALTAR=icfes,saber11
+#   CADA_DIAS                         (opcional, 25) edad mínima del corte vigente
+#                                     para que valga la pena refrescarlo
+#   FORZAR                            (opcional) FORZAR=1 ignora CADA_DIAS
+#
+# POR QUÉ CORRE TODOS LOS DÍAS SI EL CORTE ES MENSUAL
+#
+#   Un disparo mensual tiene un defecto: si ese día datos.gov.co está caído
+#   —y se cae— el mes entero se pierde y nadie se entera hasta el siguiente.
+#   Así que el disparo es diario y la decisión de trabajar la toma este script:
+#   si el corte vigente tiene menos de CADA_DIAS días, termina en segundos sin
+#   gastar nada. El primer día en que las fuentes respondan, el corte se
+#   refresca solo. No hace falta reintento en el programador ni que alguien
+#   vigile.
 
 set -u  # variable sin definir es error; pero NO set -e: los pasos fallan solos
 
@@ -74,9 +87,39 @@ else
   echo "PISA: no se encontró pisa_colombia.json; comparar_ocde responderá que no está cargado"
 fi
 
+# --- Antes de gastar un minuto: ¿está de pie el portal de datos abiertos?
+# --- Tres de las cinco fuentes viven en datos.gov.co (Socrata), y una de ellas
+# --- es el MEN, que define el universo de municipios. Sin MEN no hay fichas y
+# --- sin fichas no hay publicación, así que insistir con las otras sería gastar
+# --- contenedor para no producir nada. Una consulta de una fila lo responde.
+SONDA="https://www.datos.gov.co/resource/nudc-7mev.json?%24limit=1"
+CODIGO=$(curl -s -o /dev/null -w '%{http_code}' --max-time 45 "$SONDA" || echo 000)
+if [[ "$CODIGO" != "200" ]]; then
+  echo "================================================================"
+  echo " datos.gov.co no responde (HTTP $CODIGO). No se intenta la corrida."
+  echo " El corte vigente queda intacto. Se reintenta en la próxima pasada."
+  echo "================================================================"
+  exit 3
+fi
+echo "datos.gov.co responde (HTTP 200)"
+
 pip install --quiet --no-cache-dir \
   pandas requests pyarrow duckdb openpyxl xlrd azure-storage-blob \
   || { echo "Falló la instalación de dependencias"; exit 1; }
+
+# --- ¿Hace falta un corte nuevo? Lo dice el manifiesto que ya está publicado.
+CADA_DIAS="${CADA_DIAS:-25}"
+if [[ "${FORZAR:-0}" != "1" ]]; then
+  VIGENTE=$(python3 subir_blob.py --consultar --contenedor "${CONTENEDOR:-datos}" 2>/dev/null | tail -1)
+  EDAD=$(sed -n 's/.*dias=\([0-9]*\).*/\1/p' <<< "$VIGENTE")
+  if [[ -n "$EDAD" && "$EDAD" -lt "$CADA_DIAS" ]]; then
+    echo "================================================================"
+    echo " $VIGENTE — menos de $CADA_DIAS días. No hay nada que refrescar hoy."
+    echo "================================================================"
+    exit 0
+  fi
+  echo "Corte vigente: ${VIGENTE:-desconocido} — se procede."
+fi
 
 # --- Fuentes. El orden importa poco salvo por una cosa: territorio va primero
 # --- porque es el más rápido, y si falla algo del entorno se ve en 5 segundos

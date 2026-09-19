@@ -105,6 +105,29 @@ un dato de hace un mes que uno incompleto de hoy.
 Cada corte lleva un `manifiesto.json` con la fecha, los archivos, si la
 validación pasó y qué falló si no.
 
+### Por qué el disparo es diario y el corte mensual
+
+La primera idea era disparar la ingesta una vez al mes. Tiene un defecto que se
+vio el 19 de septiembre de 2026: ese día `datos.gov.co` estuvo caído —«Site
+Currently Unavailable», el portal entero, no un conjunto— y las siete consultas
+a Socrata agotaron sus reintentos en tres minutos. La corrida terminó sin
+publicar nada, que es lo correcto, pero con un disparo mensual eso habría
+significado **un mes entero con datos viejos y nadie enterado**.
+
+Así que el disparo es diario y la decisión de trabajar la toma el propio script:
+
+1. Pregunta si `datos.gov.co` responde. Si no, sale en segundos (código 3).
+2. Pregunta la edad del corte vigente con `subir_blob.py --consultar`. Si tiene
+   menos de `CADA_DIAS` (25 por defecto), sale sin hacer nada (código 0).
+3. Solo si el portal responde y el corte ya pasó de 25 días, ingiere.
+
+El resultado es un corte mensual que se refresca **el primer día en que las
+fuentes estén de pie**, sin reintentos en el programador y sin nadie vigilando.
+Un día de no-trabajo cuesta el arranque del contenedor y una lectura de blob:
+del orden de un minuto de cómputo, centavos al año.
+
+`FORZAR=1` ignora la edad del corte, para cuando se quiere refrescar a mano.
+
 ### Revisar un corte
 
 ```bash
@@ -251,7 +274,8 @@ real termina sin probarse.
   en Container Apps: hoy solo corre local.
 - **Desplegar el proxy.** El código está probado pero todavía no está en pie.
 - **El front y el dominio** `brujula.startinlab.org` (DNS en Hostinger).
-- **La programación mensual.** Hoy la ingesta se arranca a mano.
+- **El disparo diario.** El script ya decide solo si le toca trabajar; falta
+  la regla en Azure que arranque el contenedor una vez al día.
 - **TerriData del DNP**, que es descarga de archivo, no API.
 - **Apagar el acceso elevado en Entra ID**, que sigue activo desde el
   aprovisionamiento.
