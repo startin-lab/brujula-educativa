@@ -23,7 +23,7 @@ español, citando siempre la fuente y la fecha de corte.
 | DIVIPOLA municipios (`gdxc-w37w`) | DANE | Los 1.122 municipios con código oficial y coordenadas | vigente |
 | DIVIPOLA centros poblados (`xaxy-8nri`) | DANE | 8.161 poblados con nombre propio y coordenadas | vigente |
 | PIB departamental (`kgyi-qc7j`) | DANE | De qué vive cada departamento: 13 actividades económicas | 2005 – 2023 |
-| PISA | OCDE | Colombia frente al promedio OCDE en lectura, matemáticas y ciencias | ciclo 2025 |
+| PISA (`data/pisa_colombia.json`) | OCDE | Colombia frente al promedio OCDE en lectura, matemáticas y ciencias | ciclo 2025, publicado 08/09/2026 |
 
 Todas son fuentes oficiales y públicas. Brújula no produce datos propios ni
 estimaciones.
@@ -47,6 +47,10 @@ están documentadas a propósito y se declaran en las respuestas:
   colegio llegue hasta 2025.
 - **PISA no habla de tu colegio.** Es una prueba muestral que caracteriza al país.
   Brújula no mezcla ese dato con los resultados institucionales.
+- **PISA no tiene API.** La tabla se cura a mano desde el informe oficial y se
+  actualiza cada tres años. Solo entran los ciclos cuyas cifras de Colombia *y*
+  de la OCDE se verificaron contra fuente oficial: hoy son 2022 y 2025. Los
+  anteriores quedan fuera en vez de completarse con estimaciones.
 - **Nunca por estudiante.** Los microdatos son anónimos y solo se consultan
   agregados.
 - **No hay veredas.** En datos.gov.co la palabra devuelve 249 resultados y todos
@@ -274,6 +278,28 @@ python construir_fichas.py --datos ./data --salida ./data
 El script cachea las descargas en `.cache_icfes/`, procesa cada periodo de forma
 independiente —un archivo dañado no tumba la corrida— e imprime un reporte con el
 estado de cada uno antes de escribir `data/saber11_agregado.parquet`.
+
+---
+
+## PISA 2025
+
+Publicado el 8 de septiembre de 2026. Colombia quedó por debajo del promedio de
+la OCDE en las tres áreas:
+
+| Área | Colombia 2022 | Colombia 2025 | OCDE 2025 | Brecha |
+|---|---|---|---|---|
+| Lectura | 409 | **399** | 461 | −62 |
+| Matemáticas | 383 | **381** | 463 | −82 |
+| Ciencias | 411 | **414** | 482 | −68 |
+
+Una lectura honesta del ciclo necesita un dato más: **el promedio de la OCDE
+también cayó**, unos 14 puntos en lectura y 9 en matemáticas, y es el más bajo
+registrado hasta ahora. Parte del acortamiento de la brecha no es mejora de
+Colombia. Ciencias es el único dominio donde la distancia se redujo por ambos
+lados: Colombia subió 3 puntos y la OCDE bajó 3.
+
+Ese matiz va dentro del archivo, en `contexto`, para que el agente lo diga al
+presentar la comparación en vez de celebrar una brecha más corta.
 
 ---
 

@@ -62,6 +62,18 @@ cd "$TRABAJO" || exit 1
 mkdir -p "$DATOS"
 echo "Commit: $(git log -1 --format='%h %s')"
 
+# La tabla de PISA se cura a mano y viaja en el repo. Se busca en cualquier
+# parte del árbol en vez de exigir una ruta: subir un archivo a una subcarpeta
+# desde la web de GitHub es justo el paso que se falla, y que el corte salga sin
+# PISA por eso sería una tontería evitable.
+PISA=$(find "$TRABAJO" -name pisa_colombia.json -not -path "*/.git/*" | head -1)
+if [[ -n "$PISA" ]]; then
+  cp "$PISA" "$DATOS/pisa_colombia.json"
+  echo "PISA: tomado de ${PISA#$TRABAJO/}"
+else
+  echo "PISA: no se encontró pisa_colombia.json; comparar_ocde responderá que no está cargado"
+fi
+
 pip install --quiet --no-cache-dir \
   pandas requests pyarrow duckdb openpyxl xlrd azure-storage-blob \
   || { echo "Falló la instalación de dependencias"; exit 1; }
