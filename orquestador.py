@@ -422,10 +422,28 @@ def crear_app():
 
     @asynccontextmanager
     async def ciclo_de_vida(_: FastAPI):
-        estado["herramientas"] = Herramientas()
-        await estado["herramientas"].abrir()
-        estado["modelo"] = cliente_modelo()
+        # El portero y el correo son lo primero, y lo único imprescindible:
+        # el registro de nuevos usuarios no tiene por qué caerse porque el
+        # servidor de datos esté en mantenimiento o todavía sin corte.
         estado["portero"] = proxy.construir_portero()
+
+        estado["herramientas"] = Herramientas()
+        try:
+            await estado["herramientas"].abrir()
+        except Exception as exc:  # noqa: BLE001
+            # Arrancar igual es deliberado. Si el MCP no responde, /preguntar
+            # dirá que no hay datos —con todas las letras— mientras /registrar
+            # y /entrar siguen funcionando. Negarse a arrancar convertiría un
+            # problema de una pieza en la caída de todo el servicio.
+            LOG.error("Sin servidor MCP (%s). Las consultas quedan cerradas; "
+                      "el registro sigue abierto.", exc)
+
+        try:
+            estado["modelo"] = cliente_modelo()
+        except Exception as exc:  # noqa: BLE001
+            estado["modelo"] = None
+            LOG.error("Sin modelo configurado (%s). Las consultas quedan cerradas.", exc)
+
         yield
         await estado["herramientas"].cerrar()
 
@@ -444,14 +462,26 @@ def crear_app():
 
     @app.get("/salud")
     async def salud() -> dict[str, Any]:
+        herramientas = len(estado["herramientas"].catalogo)
         return {
-            "herramientas": len(estado["herramientas"].catalogo),
+            "herramientas": herramientas,
             "modelo": MODELO or "sin configurar",
+            "consultas": "abiertas" if (herramientas and estado.get("modelo"))
+                         else "cerradas: falta el corte de datos o el modelo",
+            "registro": "abierto",
             "portero": estado["portero"].estado(),
         }
 
     @app.post("/preguntar")
     async def preguntar(consulta: Consulta, peticion: Request) -> JSONResponse:
+        if not estado["herramientas"].catalogo or not estado.get("modelo"):
+            return JSONResponse(
+                {"motivo": "Todavía no hay un corte de datos publicado. El "
+                           "registro sí está abierto; te avisamos en cuanto "
+                           "Brújula pueda responder."},
+                status_code=503,
+            )
+
         ip = _ip_del_cliente(peticion)
         visitante = consulta.visitante or ip
         portero = estado["portero"]
