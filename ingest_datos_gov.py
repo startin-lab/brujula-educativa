@@ -207,12 +207,35 @@ def bajar_cpe() -> pd.DataFrame:
 # ICFES — agregado por colegio desde los microdatos
 # --------------------------------------------------------------------------- #
 
-def departamentos() -> list[str]:
-    """Lista de departamentos presentes en los microdatos, para trocear por ahí."""
-    datos = consultar(DATASET_SABER, {"$select": "cole_depto_ubicacion", "$group": "cole_depto_ubicacion"})
-    valores = [d.get("cole_depto_ubicacion") for d in datos if d.get("cole_depto_ubicacion")]
-    LOG.info("Saber 11: %s departamentos", len(valores))
-    return sorted(valores)
+def codigos_departamento() -> list[str]:
+    """
+    Códigos DANE de departamento, sacados del dataset del MEN.
+
+    Pedirlos al dataset de microdatos de Saber 11 (un DISTINCT sobre 8,2 millones
+    de filas sin filtro) devuelve HTTP 500 — verificado el 19/09/2026. El del MEN
+    tiene 15.707 filas y responde al instante.
+
+    Se trocea por CÓDIGO y no por nombre a propósito: los nombres difieren entre
+    fuentes por tildes y variantes ("BOGOTÁ" vs "Bogotá, D.C."), y una diferencia
+    de escritura se traduce en un departamento entero que falta sin que nadie lo note.
+    """
+    datos = consultar(DATASET_MEN, {"$select": "c_digo_departamento", "$group": "c_digo_departamento"})
+    crudos = {str(d["c_digo_departamento"]).strip().zfill(2) for d in datos if d.get("c_digo_departamento")}
+    # El MEN trae códigos espurios como "0" y "00" que no corresponden a ningún
+    # departamento. Consultarlos cuesta 17 s y devuelve cero filas.
+    codigos = sorted(c for c in crudos if c not in {"00", "0"} and c.isdigit())
+    LOG.info("Saber 11: se trocea en %s departamentos", len(codigos))
+    return codigos
+
+
+def municipios_de(cod_departamento: str) -> list[str]:
+    """Códigos de municipio de un departamento, para subdividir cuando haga falta."""
+    datos = consultar(DATASET_MEN, {
+        "$select": "c_digo_municipio",
+        "$where": f"c_digo_departamento='{cod_departamento}' OR c_digo_departamento='{cod_departamento.lstrip('0')}'",
+        "$group": "c_digo_municipio",
+    })
+    return sorted({str(d["c_digo_municipio"]).strip() for d in datos if d.get("c_digo_municipio")})
 
 
 def agregar_saber11(periodos: list[str]) -> pd.DataFrame:
@@ -253,7 +276,22 @@ def agregar_saber11(periodos: list[str]) -> pd.DataFrame:
         "cole_naturaleza, cole_area_ubicacion"
     )
 
-    deptos = departamentos()
+    def consultar_territorio(periodo: str, campo: str, codigo: str, sel: str, grp: str) -> list[dict]:
+        """
+        Consulta acotada a un territorio. El MEN guarda los códigos con cero a la
+        izquierda ("05") y Saber 11 no siempre; se piden las dos formas, porque
+        asumir una sola hace desaparecer un territorio entero sin error visible.
+        """
+        variantes = sorted({codigo, codigo.lstrip("0"), codigo.zfill(2 if campo.endswith("depto_ubicacion") else 5)} - {""})
+        lista = ", ".join(f"'{v}'" for v in variantes)
+        return consultar(DATASET_SABER, {
+            "$select": sel,
+            "$where": f"periodo='{periodo}' AND {campo} IN ({lista})",
+            "$group": grp,
+            "$limit": PAGINA,
+        })
+
+    deptos = codigos_departamento()
     partes: list[pd.DataFrame] = []
 
     for periodo in periodos:
@@ -261,21 +299,30 @@ def agregar_saber11(periodos: list[str]) -> pd.DataFrame:
         fallidos: list[str] = []
 
         for depto in deptos:
-            # Las comillas simples en el nombre romperían el WHERE; se duplican.
-            seguro = depto.replace("'", "''")
             try:
-                datos = consultar(
-                    DATASET_SABER,
-                    {
-                        "$select": seleccion,
-                        "$where": f"periodo='{periodo}' AND cole_depto_ubicacion='{seguro}'",
-                        "$group": agrupacion,
-                        "$limit": PAGINA,
-                    },
-                )
+                datos = consultar_territorio(periodo, "cole_cod_depto_ubicacion", depto, seleccion, agrupacion)
             except Exception as exc:  # noqa: BLE001
-                fallidos.append(depto)
-                LOG.warning("Saber 11 %s / %s: %s", periodo, depto, str(exc)[:140])
+                # Los departamentos grandes (Antioquia, Valle) tienen tantos
+                # estudiantes que el motor de Socrata también se rinde con ellos.
+                # Verificado el 19/09/2026: Atlántico y Bogotá responden en menos
+                # de 3 s, Antioquia devuelve HTTP 500. En vez de subdividir todo
+                # el país por municipio —1.122 consultas por periodo— solo se
+                # subdivide el departamento que falla.
+                LOG.info("Saber 11 %s / depto %s: no cabe en una consulta (%s). Subdividiendo por municipio.",
+                         periodo, depto, str(exc)[:60])
+                logrados = 0
+                for mcpio in municipios_de(depto):
+                    try:
+                        d2 = consultar_territorio(periodo, "cole_cod_mcpio_ubicacion", mcpio, seleccion, agrupacion)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if d2:
+                        del_periodo.append(pd.DataFrame(d2))
+                        logrados += 1
+                if logrados == 0:
+                    fallidos.append(depto)
+                else:
+                    LOG.info("Saber 11 %s / depto %s: recuperado con %s municipios", periodo, depto, logrados)
                 continue
 
             if datos:
