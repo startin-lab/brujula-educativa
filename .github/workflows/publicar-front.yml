@@ -1,0 +1,56 @@
+# Brújula Educativa — publicación del front
+# Fundación Startin
+#
+# Sube el contenido de web/ a la Static Web App cada vez que cambia.
+#
+# POR QUÉ ESTE CAMINO Y NO LA INTEGRACIÓN AUTOMÁTICA DE AZURE
+#
+#   El asistente de Azure ofrece conectarse a GitHub por OAuth y escribir este
+#   archivo solo. No pudimos usarlo: la app de Azure no alcanzaba a ver la
+#   organización startin-lab, así que el repositorio nunca aparecía en la lista.
+#
+#   Hacerlo así resulta mejor de todas formas. El despliegue queda versionado
+#   con el resto del proyecto, se lee, se revisa y se cambia como cualquier otro
+#   archivo, y no depende de un permiso concedido una vez en una pantalla que
+#   nadie recuerda.
+#
+# EL SECRETO QUE NECESITA
+#
+#   AZURE_SWA_TOKEN — el token de implementación de la Static Web App.
+#   Se copia desde el portal (la app brujula-web -> Información general ->
+#   «Administrar token de implementación») y se pega en el repositorio, en
+#   Settings -> Secrets and variables -> Actions -> New repository secret.
+#
+#   Es una credencial: solo la ve quien la pega. Si alguna vez se filtra, se
+#   regenera desde esa misma pantalla del portal y se vuelve a pegar aquí.
+
+name: Publicar el front
+
+on:
+  push:
+    branches: [main]
+    # Solo cuando cambia la página. Tocar un .py de la ingesta no tiene por qué
+    # disparar un despliegue del sitio.
+    paths:
+      - 'web/**'
+      - '.github/workflows/publicar-front.yml'
+  workflow_dispatch:        # para poder publicar a mano cuando haga falta
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    name: Subir web/ a Static Web Apps
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Desplegar
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_SWA_TOKEN }}
+          action: upload
+          app_location: 'web'   # la carpeta que se publica
+          api_location: ''      # no hay funciones: el backend es el MCP, aparte
+          output_location: ''   # HTML plano
+          # Sin paso de compilación: la página es un solo archivo, sin bundler
+          # ni dependencias. Si algún día deja de serlo, se quita esta línea.
+          skip_app_build: true
