@@ -251,6 +251,13 @@ def main() -> int:
         print(f"Generando territorio sintético en {datos}")
         generar(datos)
 
+        # La tabla de PISA es curada a mano y vive en el repo, no se genera.
+        # Se copia tal cual para probar contra las cifras reales.
+        pisa = RAIZ / "data" / "pisa_colombia.json"
+        if pisa.exists():
+            (datos / "pisa_colombia.json").write_text(
+                pisa.read_text(encoding="utf-8"), encoding="utf-8")
+
         print("Construyendo fichas...")
         r = subprocess.run(
             [sys.executable, str(RAIZ / "construir_fichas.py"), "--datos", str(datos), "--salida", str(datos)],
@@ -379,8 +386,23 @@ def main() -> int:
         check("reporta vistas cargadas y limitaciones",
               ed["encontrado"] and len(ed["limitaciones_conocidas"]) >= 5)
         po = llamar(S.comparar_ocde, dominio="lectura")
-        check("PISA ausente: lo dice, no inventa cifras",
-              po["encontrado"] is False and "no está cargada" in po["mensaje"])
+        if (datos / "pisa_colombia.json").exists():
+            check("PISA cargado", po["encontrado"] is True, po)
+            check("Colombia 2025 en lectura = 399", po["colombia"][-1] == 399, po["colombia"])
+            check("promedio OCDE 2025 en lectura = 461", po["ocde"][-1] == 461, po["ocde"])
+            check("advierte que es muestral y no habla de un colegio",
+                  any("muestral" in a for a in po["advertencias"]))
+            mat = llamar(S.comparar_ocde, dominio="matematicas")
+            check("matemáticas: Colombia 381 vs OCDE 463",
+                  mat["colombia"][-1] == 381 and mat["ocde"][-1] == 463)
+            cie = llamar(S.comparar_ocde, dominio="ciencias")
+            check("ciencias: Colombia 414 vs OCDE 482",
+                  cie["colombia"][-1] == 414 and cie["ocde"][-1] == 482)
+            check("dominio inexistente no inventa",
+                  llamar(S.comparar_ocde, dominio="filosofia")["encontrado"] is False)
+        else:
+            check("PISA ausente: lo dice, no inventa cifras",
+                  po["encontrado"] is False and "no está cargada" in po["mensaje"])
 
         print("\n== 12. Contexto territorial: dónde queda y qué es ==")
         check("la ficha dice dónde queda",

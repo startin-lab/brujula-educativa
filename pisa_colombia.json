@@ -1,0 +1,39 @@
+{
+  "_nota": "Curado a mano desde las fuentes oficiales. La OCDE no publica PISA por API: este archivo se actualiza cuando sale un ciclo nuevo, cada tres años. Solo se incluyen ciclos cuyas cifras de Colombia Y de la OCDE se verificaron contra una fuente oficial; los anteriores a 2022 quedan pendientes de curar y por eso no aparecen, en vez de completarse con estimaciones.",
+  "fuente": "OCDE — PISA 2025 (Volumen I) y MinEducación, informe nacional PISA 2022",
+  "corte": "2026-09-08",
+  "ciclo_mas_reciente": 2025,
+  "verificado": "2026-09-19",
+  "urls": [
+    "https://www.oecd.org/en/publications/pisa-2025-results-volume-i_73451bc5-en/full-report/student-performance-in-pisa-2025_23e075c2.html",
+    "https://www.oecd.org/en/publications/pisa-2025-results-volume-i-country-notes_2d4ff9ea-en/colombia_d64a60a2-en.html",
+    "https://www.mineducacion.gov.co/portal/salaprensa/Comunicados/417751:Pruebas-PISA-2022-Colombia-un-sistema-educativo-resiliente-que-requiere-cambios-estructurales-para-mejorar-su-calidad"
+  ],
+  "cobertura_2025": {
+    "estudiantes_evaluados": 760000,
+    "paises_y_economias": 91
+  },
+  "lectura": {
+    "ciclos": ["2022", "2025"],
+    "colombia": [409, 399],
+    "ocde": [476, 461],
+    "brecha_ultimo_ciclo": -62
+  },
+  "matematicas": {
+    "ciclos": ["2022", "2025"],
+    "colombia": [383, 381],
+    "ocde": [472, 463],
+    "brecha_ultimo_ciclo": -82
+  },
+  "ciencias": {
+    "ciclos": ["2022", "2025"],
+    "colombia": [411, 414],
+    "ocde": [485, 482],
+    "brecha_ultimo_ciclo": -68
+  },
+  "contexto": [
+    "En PISA 2025 el promedio de la OCDE cayó en lectura (unos 14 puntos) y en matemáticas (unos 9) frente a 2022: es el promedio más bajo registrado hasta ahora. Parte de la reducción de la brecha de Colombia se explica por esa caída general, no por una mejora propia.",
+    "Colombia subió 3 puntos en ciencias entre 2022 y 2025, mientras el promedio OCDE bajó 3. Es el único dominio donde la distancia se acortó por ambos lados.",
+    "En lectura Colombia perdió 10 puntos, su caída más fuerte del ciclo."
+  ]
+}
