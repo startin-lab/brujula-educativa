@@ -1,0 +1,122 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "comentario": "Brújula Educativa — orquestador. Fundación Startin. Recibe la pregunta del front, la pasa por el portero de cuotas, se la da al modelo con las herramientas del MCP y devuelve la respuesta con sus visualizaciones. Sin claves: identidad administrada contra Storage (contadores) y contra Foundry (modelo)."
+  },
+  "parameters": {
+    "cuentaStorage": { "type": "string", "defaultValue": "stbrujulastartin" },
+    "entorno": { "type": "string", "defaultValue": "brujula-entorno" },
+    "region": { "type": "string", "defaultValue": "eastus2" },
+    "repositorio": { "type": "string", "defaultValue": "https://github.com/startin-lab/brujula-educativa.git" },
+    "recursoFoundry": {
+      "type": "string",
+      "defaultValue": "brujula-educativa-startin",
+      "metadata": { "description": "Nombre del recurso de Foundry donde vive el modelo." }
+    },
+    "endpointFoundry": {
+      "type": "string",
+      "defaultValue": "https://brujula-educativa-startin.cognitiveservices.azure.com/"
+    },
+    "modelo": {
+      "type": "string",
+      "defaultValue": "gpt-5.4-mini",
+      "metadata": { "description": "Nombre del despliegue en Foundry, no el del modelo del catálogo." }
+    },
+    "urlMcp": {
+      "type": "string",
+      "defaultValue": "https://brujula-mcp.ambitiousplant-035eb04f.eastus2.azurecontainerapps.io/sse"
+    },
+    "origenes": {
+      "type": "string",
+      "defaultValue": "https://brujula.startinlab.org",
+      "metadata": { "description": "Quién puede llamar al orquestador desde un navegador. Un comodín aquí dejaría que cualquier página gaste el presupuesto de la fundación." }
+    }
+  },
+  "variables": {
+    "app": "brujula-orquestador",
+    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; pip install --no-cache-dir --quiet fastapi uvicorn mcp openai azure-identity azure-data-tables; exec uvicorn orquestador:app --host 0.0.0.0 --port 8000"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('app')]",
+      "location": "[parameters('region')]",
+      "identity": { "type": "SystemAssigned" },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('entorno'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": true,
+            "targetPort": 8000,
+            "transport": "auto",
+            "allowInsecure": false,
+            "traffic": [ { "latestRevision": true, "weight": 100 } ]
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "orquestador",
+              "image": "mcr.microsoft.com/devcontainers/python:3.12",
+              "command": [ "/bin/bash", "-lc" ],
+              "args": [ "[variables('arranque')]" ],
+              "resources": { "cpu": 0.5, "memory": "1Gi" },
+              "env": [
+                { "name": "REPO", "value": "[parameters('repositorio')]" },
+                { "name": "BRUJULA_MCP_URL", "value": "[parameters('urlMcp')]" },
+                { "name": "BRUJULA_FOUNDRY_ENDPOINT", "value": "[parameters('endpointFoundry')]" },
+                { "name": "BRUJULA_MODELO", "value": "[parameters('modelo')]" },
+                { "name": "BRUJULA_ORIGENES", "value": "[parameters('origenes')]" },
+                { "name": "AZURE_STORAGE_CUENTA", "value": "[parameters('cuentaStorage')]" },
+                { "name": "BRUJULA_PRESUPUESTO_MENSUAL_USD", "value": "300" }
+              ],
+              "probes": [
+                {
+                  "type": "Startup",
+                  "httpGet": { "path": "/salud", "port": 8000 },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "failureThreshold": 60
+                }
+              ]
+            }
+          ],
+          "scale": { "minReplicas": 1, "maxReplicas": 3 }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('app'), 'tablas')]",
+      "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('cuentaStorage'))]",
+      "dependsOn": [ "[resourceId('Microsoft.App/containerApps', variables('app'))]" ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('app'), 'modelo')]",
+      "scope": "[concat('Microsoft.CognitiveServices/accounts/', parameters('recursoFoundry'))]",
+      "dependsOn": [ "[resourceId('Microsoft.App/containerApps', variables('app'))]" ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "url": {
+      "type": "string",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01').configuration.ingress.fqdn)]"
+    }
+  }
+}
