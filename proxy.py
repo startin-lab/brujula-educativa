@@ -39,9 +39,9 @@ FALLA CERRADO
   existe para impedir. Ante la duda, no se llama al modelo.
 
 Uso:
-    pip install fastapi uvicorn httpx azure-data-tables
+    pip install fastapi uvicorn httpx azure-data-tables azure-identity
     export BRUJULA_PRESUPUESTO_MENSUAL_USD=300
-    export AZURE_STORAGE_CONNECTION_STRING=...
+    export AZURE_STORAGE_CUENTA=...          # o AZURE_STORAGE_CONNECTION_STRING
     uvicorn proxy:app --host 0.0.0.0 --port 8000
 """
 
@@ -287,13 +287,26 @@ class AlmacenTablas:
             raise RuntimeError("Falta azure-data-tables: pip install azure-data-tables")
         from azure.data.tables import TableServiceClient  # noqa: PLC0415
 
+        # Dos formas de identificarse, y se prefiere la primera:
+        #   1. AZURE_STORAGE_CUENTA + identidad administrada: sin claves.
+        #   2. AZURE_STORAGE_CONNECTION_STRING: una clave con permiso total.
+        cuenta = os.environ.get("AZURE_STORAGE_CUENTA", "")
         cadena = cadena_conexion or os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
-        if not cadena:
-            raise RuntimeError(
-                "AlmacenTablas necesita AZURE_STORAGE_CONNECTION_STRING. "
-                "Sin almacén compartido, cada réplica llevaría su propio tope."
+        if cuenta and not cadena_conexion:
+            from azure.identity import DefaultAzureCredential  # noqa: PLC0415
+
+            servicio = TableServiceClient(
+                endpoint=f"https://{cuenta}.table.core.windows.net",
+                credential=DefaultAzureCredential(),
             )
-        servicio = TableServiceClient.from_connection_string(cadena)
+        elif cadena:
+            servicio = TableServiceClient.from_connection_string(cadena)
+        else:
+            raise RuntimeError(
+                "AlmacenTablas necesita AZURE_STORAGE_CUENTA (identidad) o "
+                "AZURE_STORAGE_CONNECTION_STRING. Sin almacén compartido, cada "
+                "réplica llevaría su propio tope."
+            )
         nombre = f"{prefijo}contadores"
         try:
             servicio.create_table(nombre)
@@ -559,7 +572,7 @@ def construir_portero() -> Portero:
     El aviso importa: con contadores en memoria y varias réplicas, el tope
     diario se multiplica por el número de réplicas sin que nada lo indique.
     """
-    if os.environ.get("AZURE_STORAGE_CONNECTION_STRING"):
+    if os.environ.get("AZURE_STORAGE_CUENTA") or os.environ.get("AZURE_STORAGE_CONNECTION_STRING"):
         try:
             return Portero(almacen=AlmacenTablas())
         except Exception as exc:  # noqa: BLE001
