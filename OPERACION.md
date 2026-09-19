@@ -87,8 +87,18 @@ datos/
 tiene que seguir siendo verificable en julio; si cada ingesta pisara a la
 anterior, nadie podría reconstruir de dónde salió un número.
 
-`actual/` es lo que lee el agente. Se mueve **solo si la corrida pasa las cinco
-validaciones de volumen** de `subir_blob.py`. Una corrida a medias se guarda con
+`actual/` es lo que lee el agente. Se mueve **solo si el corte pasa la
+validación** de `subir_blob.py`, que hace dos preguntas distintas:
+
+1. **¿Hay algún archivo vacío?** Pisos absolutos, deliberadamente bajos.
+2. **¿Alguna fuente encogió frente al corte anterior?** Más de un 20 % menos que
+   lo publicado el mes pasado es una fuente que hoy respondió a medias.
+
+La segunda es la que sirve, y se calibra sola. La primera versión usaba umbrales
+escritos a mano —40.000 filas para Saber 11— calculados cuando la ingesta cubría
+once periodos; al recortar a cinco el número real pasó a 21.749 y la validación
+bloqueó un corte bueno. Un umbral a mano envejece mal: nadie lo mueve cuando
+cambia el alcance. Una corrida a medias se guarda con
 su fecha —sirve para depurar— pero no se convierte en la versión vigente: mejor
 un dato de hace un mes que uno incompleto de hoy.
 
@@ -114,9 +124,15 @@ Docker Hub limita las descargas anónimas desde Azure. Por eso la imagen es
 `mcr.microsoft.com/devcontainers/python:3.12`, del registro de Microsoft, que
 además ya trae git. No volver a Docker Hub.
 
-**La validación falla y `actual/` no se mueve.** Es el comportamiento correcto,
-no un error. Mirar el `manifiesto.json` del corte: dice qué archivo salió corto.
-Casi siempre es una fuente que respondió a medias ese día. Volver a correr.
+**La validación falla y `actual/` no se mueve.** Suele ser el comportamiento
+correcto: mirar el `manifiesto.json` del corte, que dice qué archivo salió corto
+y contra qué se comparó. Casi siempre es una fuente que respondió a medias ese
+día; volver a correr.
+
+Pero conviene desconfiar cuando fallan *todas* las fuentes a la vez: eso no es
+una fuente caída, es la validación rota. Ya pasó una vez —el conteo de filas
+devolvía cero para todo— y el síntoma fue exactamente ese. `probar_publicacion.py`
+existe para que no vuelva a pasar sin avisar.
 
 **Una fuente falla pero la corrida sigue.** También es a propósito. Las fuentes
 públicas colombianas se caen por turnos; que el ICFES esté abajo un martes no es
@@ -218,7 +234,9 @@ caído significa que no sabemos cuánto llevamos gastado, y gastar sin saber es
 justo lo que este componente existe para impedir. Está probado.
 
 ```bash
-python probar_proxy.py    # incluye la prueba de concurrencia
+python probar_proxy.py         # incluye la prueba de concurrencia
+python probar_publicacion.py   # la validación que decide si se publica
+python probar_server.py        # las 13 herramientas del MCP
 ```
 
 Corre sin credenciales ni SDK de Azure: usa una tabla simulada que reproduce los

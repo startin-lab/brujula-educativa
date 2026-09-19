@@ -144,22 +144,34 @@ def vocabulario_secop() -> dict[str, list[str]]:
     """
     Cómo escribe SECOP cada municipio, indexado por el nombre normalizado.
 
-    Es UNA consulta nacional al inicio de la corrida (~122 s). Cuesta dos
-    minutos y evita el modo de falla más caro de todo el proyecto: un municipio
-    que devuelve cero contratos no porque no contrate, sino porque su nombre
-    lleva una tilde distinta. Ese error no lanza excepción y no aparece en
-    ningún log; simplemente borra un territorio del diagnóstico.
+    Cuesta una consulta nacional al inicio (~2 min) y evita el modo de falla más
+    caro del proyecto: un municipio que devuelve cero contratos no porque no
+    contrate, sino porque su nombre lleva una tilde distinta. Ese error no lanza
+    excepción y no aparece en ningún log; borra un territorio del diagnóstico.
 
-    Devuelve una LISTA de grafías por nombre, no una sola, porque hay municipios
-    escritos de varias formas en el mismo dataset.
+    SE SUBDIVIDE POR DEPARTAMENTO SI LA CONSULTA NACIONAL FALLA.
+
+      Medido el 19/09/2026: la misma consulta respondió en 139 s por la mañana y
+      agotó los reintentos por la tarde, tumbando la ingesta de SECOP entera.
+      datos.gov.co no garantiza nada sobre agregaciones nacionales, y apostar la
+      fuente completa a que una consulta pesada responda es frágil.
+
+      El plan B es el mismo patrón que ya rescató a Saber 11: pedir el
+      vocabulario departamento por departamento. Son 33 consultas pequeñas en
+      vez de una grande, y cada una es reintentable por su cuenta.
     """
     LOG.info("SECOP: pidiendo el vocabulario de municipios (tarda ~2 min)...")
     t0 = time.time()
-    datos = consultar(DATASET_SECOP, {
-        "$select": "municipio_entidad, count(*) as n",
-        "$group": "municipio_entidad",
-        "$limit": LIMITE_SOCRATA,
-    }, timeout=TIMEOUT_VOCABULARIO)
+    try:
+        datos = consultar(DATASET_SECOP, {
+            "$select": "municipio_entidad, count(*) as n",
+            "$group": "municipio_entidad",
+            "$limit": LIMITE_SOCRATA,
+        }, timeout=TIMEOUT_VOCABULARIO)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("SECOP: la consulta nacional falló (%s). "
+                    "Reintentando por departamento.", str(exc)[:90])
+        datos = _vocabulario_por_departamento()
 
     vocabulario: dict[str, list[str]] = {}
     for fila in datos:
@@ -168,10 +180,61 @@ def vocabulario_secop() -> dict[str, list[str]]:
             continue
         vocabulario.setdefault(normalizar(crudo), []).append(crudo)
 
+    if not vocabulario:
+        raise RuntimeError(
+            "SECOP no devolvió ningún municipio, ni en la consulta nacional ni "
+            "por departamento. Sin vocabulario no se puede cruzar nada."
+        )
+
     varias = sum(1 for v in vocabulario.values() if len(v) > 1)
     LOG.info("SECOP: %s municipios distintos en %.0f s (%s con varias grafías)",
              len(vocabulario), time.time() - t0, varias)
     return vocabulario
+
+
+def _vocabulario_por_departamento() -> list[dict]:
+    """
+    Plan B: el vocabulario en 33 trozos.
+
+    Un departamento que falle se registra y se sigue: perder un departamento del
+    cruce es malo, perder los 33 porque uno falló es peor.
+    """
+    try:
+        deptos = [
+            (d.get("departamento_entidad") or "").strip()
+            for d in consultar(DATASET_SECOP, {
+                "$select": "departamento_entidad",
+                "$group": "departamento_entidad",
+                "$limit": 200,
+            }, timeout=TIMEOUT_VOCABULARIO)
+        ]
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"SECOP: tampoco se pudo listar departamentos: {exc}") from exc
+
+    deptos = [d for d in deptos if d]
+    LOG.info("SECOP: %s departamentos para pedir el vocabulario por partes", len(deptos))
+
+    filas: list[dict] = []
+    fallidos: list[str] = []
+    for i, depto in enumerate(deptos, 1):
+        seguro = depto.replace("'", "''")
+        try:
+            parte = consultar(DATASET_SECOP, {
+                "$select": "municipio_entidad",
+                "$where": f"departamento_entidad='{seguro}'",
+                "$group": "municipio_entidad",
+                "$limit": LIMITE_SOCRATA,
+            })
+            filas.extend(parte)
+            LOG.info("  [%s/%s] %s — %s municipios", i, len(deptos), depto, len(parte))
+        except Exception as exc:  # noqa: BLE001
+            fallidos.append(depto)
+            LOG.warning("  [%s/%s] %s — falló: %s", i, len(deptos), depto, str(exc)[:80])
+
+    if fallidos:
+        LOG.warning("SECOP: sin vocabulario de %s departamentos: %s",
+                    len(fallidos), ", ".join(fallidos))
+    return filas
 
 
 def municipios_men() -> list[tuple[str, str, str]]:
