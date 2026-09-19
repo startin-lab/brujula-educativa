@@ -178,7 +178,17 @@ def main() -> int:
         LOG.error("No hay nada que subir en %s", args.datos)
         return 1
 
-    corte = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ahora = datetime.now(timezone.utc)
+    corte = ahora.strftime("%Y-%m-%d")
+    # La carpeta lleva la HORA, no solo la fecha.
+    #
+    # Antes era solo la fecha, y dos corridas el mismo día se pisaban: la
+    # segunda sobrescribía los archivos que compartía con la primera y, peor,
+    # sobrescribía el manifiesto. El 19/09/2026 eso dejó una carpeta con quince
+    # archivos de dos corridas distintas descrita por un manifiesto que solo
+    # mencionaba dos. El corte fechado existe para poder reconstruir de dónde
+    # salió un número; una mezcla de dos corridas no sirve para eso.
+    carpeta = ahora.strftime("%Y-%m-%d-%H%M")
 
     cliente = BlobServiceClient.from_connection_string(conexion)
     contenedor = cliente.get_container_client(args.contenedor)
@@ -215,7 +225,7 @@ def main() -> int:
     # corrida mala es evidencia de qué pasó ese día y sirve para depurar.
     subidos = 0
     for archivo in archivos:
-        destino = f"cortes/{corte}/{archivo.name}"
+        destino = f"cortes/{carpeta}/{archivo.name}"
         with archivo.open("rb") as f:
             contenedor.upload_blob(name=destino, data=f, overwrite=True)
         subidos += 1
@@ -223,7 +233,8 @@ def main() -> int:
 
     manifiesto = {
         "corte": corte,
-        "generado": datetime.now(timezone.utc).isoformat(),
+        "carpeta": carpeta,
+        "generado": ahora.isoformat(),
         "archivos": [a.name for a in archivos],
         # Los conteos viajan en el manifiesto porque son la referencia contra la
         # que se validará el corte del mes que viene.
@@ -232,7 +243,7 @@ def main() -> int:
         "problemas": problemas,
     }
     contenedor.upload_blob(
-        name=f"cortes/{corte}/manifiesto.json",
+        name=f"cortes/{carpeta}/manifiesto.json",
         data=json.dumps(manifiesto, ensure_ascii=False, indent=2).encode(),
         overwrite=True,
     )

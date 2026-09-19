@@ -105,6 +105,17 @@ un dato de hace un mes que uno incompleto de hoy.
 Cada corte lleva un `manifiesto.json` con la fecha, los archivos, si la
 validación pasó y qué falló si no.
 
+### Una carpeta por corrida, no por día
+
+`cortes/` lleva una carpeta por corrida con fecha **y hora**
+(`cortes/2026-09-19-2224/`), no solo fecha. La primera versión usaba solo la
+fecha y dos corridas del mismo día se pisaban: la segunda sobrescribía los
+archivos compartidos y también el manifiesto. El 19/09/2026 quedó así una
+carpeta con quince archivos de dos corridas distintas, descrita por un
+manifiesto que solo mencionaba dos. Un corte fechado existe para poder
+reconstruir de dónde salió un número, y una mezcla de dos corridas no sirve
+para eso. `actual/` sigue siendo el puntero al corte vigente.
+
 ### Por qué el disparo es diario y el corte mensual
 
 La primera idea era disparar la ingesta una vez al mes. Tiene un defecto que se
