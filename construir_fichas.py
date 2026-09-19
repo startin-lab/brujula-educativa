@@ -155,13 +155,25 @@ GROUP BY s.cod_municipio
 """
 
 SQL_CPE_ULTIMO = """
+-- Computadores Para Educar. Sumar aquí es correcto SOLO porque la ingesta ya
+-- dejó un registro por municipio-año; antes había un corte mensual desde 2020 y
+-- sumarlos multiplicaba lo entregado por doce.
+--
+-- Se guardan dos cosas distintas y se nombran distinto: el ACUMULADO histórico
+-- (qué recibió este municipio en toda la vida del programa, que es lo que sirve
+-- para no volver a prometer lo ya entregado) y el ÚLTIMO AÑO CON ACTIVIDAD, que
+-- casi nunca es reciente: el programa se apaga después de 2019.
 CREATE OR REPLACE TABLE cpe_ultimo AS
 SELECT
     cod_municipio,
-    max(anio)                                     AS anio_cpe,
-    arg_max(ninos_por_terminal, anio) FILTER (ninos_por_terminal IS NOT NULL) AS ninos_por_terminal,
-    sum(COALESCE(terminales, 0))                  AS terminales_entregadas,
-    sum(COALESCE(docentes_formados, 0))           AS docentes_formados
+    max(anio)                                                   AS anio_cpe,
+    max(anio) FILTER (terminales_entregadas > 0)                AS ultimo_anio_con_entregas,
+    sum(COALESCE(terminales_entregadas, 0))                     AS terminales_historicas,
+    sum(COALESCE(docentes_formados, 0))                         AS docentes_formados_historico,
+    sum(COALESCE(inversion, 0))                                 AS inversion_historica,
+    arg_max(ninos_por_terminal, anio) FILTER (ninos_por_terminal IS NOT NULL)
+                                                                AS ninos_por_terminal,
+    arg_max(anio, anio) FILTER (ninos_por_terminal IS NOT NULL)  AS anio_ninos_por_terminal
 FROM cpe
 WHERE cod_municipio IS NOT NULL
 GROUP BY cod_municipio
@@ -203,7 +215,9 @@ def construir_municipios(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -
                       "s.pct_internet, s.pct_computador")
     if hay["cpe"]:
         joins.append("LEFT JOIN cpe_ultimo c USING (cod_municipio)")
-        campos.append("c.anio_cpe, c.ninos_por_terminal, c.terminales_entregadas, c.docentes_formados")
+        campos.append("c.anio_cpe, c.ultimo_anio_con_entregas, c.ninos_por_terminal, "
+                      "c.anio_ninos_por_terminal, c.terminales_historicas, "
+                      "c.docentes_formados_historico, c.inversion_historica")
     if hay["secop"]:
         joins.append("LEFT JOIN secop k USING (cod_municipio)")
         campos.append("k.n_contratos_educacion, k.valor_total_educacion")

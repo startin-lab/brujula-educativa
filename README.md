@@ -14,10 +14,10 @@ español, citando siempre la fuente y la fecha de corte.
 
 | Fuente | Entidad | Qué aporta | Corte |
 |---|---|---|---|
-| Resultados agregados por establecimiento | ICFES | Promedio, desviación y evaluados por área, sede por sede | 2024 – 2025 |
-| Resultados únicos Saber 11 (`kgxf-xxbe`) | ICFES | Microdatos por estudiante; incluye internet y computador en el hogar | 2010 – 2022 |
+| Resultados agregados por establecimiento | ICFES | Promedio, desviación y evaluados por área, sede por sede | **2021 – 2025** |
+| Resultados únicos Saber 11 (`kgxf-xxbe`) | ICFES | Brecha digital del hogar: internet y computador declarados | **2019 – 2022** |
 | Estadísticas en educación por municipio (`nudc-7mev`) | MinEducación | 41 indicadores de cobertura, deserción, aprobación y repitencia por nivel | 2011 – 2024 |
-| Computadores Para Educar (`pyqj-s96k`) | MinTIC | Niños por terminal, equipos y tabletas entregados, docentes formados | hasta 2023 |
+| Computadores Para Educar (`pyqj-s96k`) | MinTIC | Qué recibió ya cada municipio: equipos, docentes formados, inversión | 2010 – 2022 |
 | Indicadores de infraestructura (`3ncw-3qwq`) | MinEducación | Aulas nuevas y mejoradas por sede | hasta 2021 |
 | SECOP Integrado (`rpmr-utcd`) | Colombia Compra Eficiente | Contratos cuyo objeto menciona educación, por municipio de la entidad | 2026-09 |
 | DIVIPOLA municipios (`gdxc-w37w`) | DANE | Los 1.122 municipios con código oficial y coordenadas | vigente |
@@ -143,6 +143,86 @@ histórica se reconstruye desde los microdatos de datos.gov.co.
 
 *Reportado al ICFES en septiembre de 2026.*
 
+## Alcance: cinco años, y por qué cada fuente lo aplica distinto
+
+**Archivos agregados del ICFES → 2021 en adelante.** El recorte sale casi gratis:
+de los nueve periodos que quedan fuera, **siete venían dañados en el servidor del
+ICFES**. Los dos que sí abrían son de calendario B, con ~350 establecimientos: no
+dan cobertura nacional. Quedan seis periodos usables con ~14.000 sedes cada uno,
+que es lo que alimenta la tendencia por colegio.
+
+**Microdatos → solo cinco periodos (2019-2022).** No por antigüedad, sino por lo
+que aportan. El resultado por sede de estos años ya viene en los archivos
+agregados; reconstruirlo desde los microdatos es repetir trabajo con más latencia.
+Lo que **solo** está en los microdatos es la conectividad declarada del hogar, y
+eso se detiene en 2022. Se conservan los dos censos nacionales grandes —2019-4 con
+1.096.524 registros y 2022-4 con 1.065.888— porque dan el antes y el después de la
+pandemia sobre la brecha digital. 2019-4 se sale del corte de cinco años a
+propósito: sin él no hay con qué comparar 2022.
+
+Los periodos retirados quedan escritos uno por uno con su razón, en
+`ARCHIVOS_FUERA_DE_ALCANCE` y `PERIODOS_EXCLUIDOS`, y la ingesta se detiene si
+alguien pide uno. Están así para que nadie los reponga creyendo que fueron un
+descuido.
+
+---
+
+## Computadores Para Educar tiene tres trampas
+
+Es el registro de *«esto ya te lo dieron»*, que es justo lo que hace falta antes
+de prometerle equipos a una institución. Pero leerlo de frente produce cifras
+absurdas. Verificado contando valores distintos por año sobre los 1.121
+municipios:
+
+**1. Tres columnas son cifras nacionales repetidas en cada fila.**
+`meta_terminales_entregadas`, `meta_docentes_formados` y —la más traicionera—
+`sedes_beneficiadas` tienen **un solo valor distinto en todo el país** para cada
+año. Un municipio de Santander aparece en 2012 con 155 computadores entregados y,
+al lado, «3.889 sedes beneficiadas». No son suyas: son del programa entero.
+Publicarlas por municipio diría que los 1.121 recibieron lo mismo que el país.
+
+**2. `ni_os_por_terminal` es departamental, no municipal.** Tiene entre 33 y 35
+valores distintos por año: uno por departamento. El municipal es
+`ni_os_por_terminal_municipal`. Los nombres invitan al error exacto, así que la
+ingesta los renombra para que el nombre diga lo que el dato es.
+
+**3. Desde 2020 hay una fila por mes, no por año.** Hasta 2019 son 1.121 filas
+anuales; en 2021 son 14.581 — cortes mensuales acumulados, más una fila basura con
+`fecha_corte` 1900-01-01. Sumarlas multiplicaría lo entregado por doce.
+
+Y una advertencia que va pegada a toda respuesta: **es historia, no presente.** El
+programa entrega a más de 1.000 municipios al año hasta 2015, a 354 en 2017, a 65
+en 2019, y el dataset deja de actualizarse en febrero de 2023. Dice qué se entregó
+ya, no cuántos equipos hay hoy ni en qué estado.
+
+---
+
+### La reforma de 2014 parte la serie en dos
+
+El dataset de microdatos trae 23 periodos desde 2010, pero **solo se ingieren los
+posteriores a 2014-2**, y no por comodidad: antes de esa fecha era otra prueba.
+
+| periodo | lectura | matemáticas | c. naturales | inglés | global |
+|---|---|---|---|---|---|
+| 2011-1 | — | 60.14 | — | 79.55 | — |
+| 2012-2 | — | 45 | — | 48 | — |
+| 2014-1 | — | 55 | — | 75 | — |
+| **2014-2** | **35** | 45 | **43** | 42 | **212** |
+| 2019-4 | 69 | 66 | 65 | 71 | 339 |
+
+Hasta 2014-1 no existen `punt_lectura_critica` ni `punt_global`: vienen nulos
+porque esas áreas no se evaluaban así. Y los puntajes de 2010 y 2011 son
+decimales sobre otra escala —de ahí los `"35,2"` que revientan el cast a número.
+
+Ingerirlos no daría un error: daría una **serie falsa**. Un municipio mostraría
+una "evolución" de 2010 a 2022 cuyo primer tramo mide otra cosa. Para una
+herramienta que existe para sustentar diagnósticos, inventar una tendencia es
+peor que no tenerla.
+
+`PERIODOS_EXCLUIDOS` deja escrito cada periodo omitido con su razón, y la ingesta
+se detiene si alguien pide uno de ellos. Está así para que nadie los "recupere"
+dentro de seis meses creyendo que fueron un olvido.
+
 ### Trampas de tipado
 
 - Los puntajes de `kgxf-xxbe` están almacenados como **texto**, no como número.
@@ -158,6 +238,12 @@ histórica se reconstruye desde los microdatos de datos.gov.co.
   MEN los trae en mayúscula sostenida («CUNDINAMARCA»), y **el `LIKE` de Socrata
   distingue mayúsculas**: filtrar por nombre devuelve cero filas sin avisar.
 - Los códigos de departamento del PIB van **sin cero a la izquierda** (`"5"`).
+- SECOP guarda el municipio **por nombre, no por código DANE**, y lo escribe
+  distinto que el MEN: 86 municipios difieren en tildes o mayúsculas, y 74 tienen
+  más de una grafía dentro del propio SECOP. Bogotá aparece como `Bogotá` y como
+  `Bogotá D.C.`, mientras el MEN la llama `Bogotá, D.C.`. Por eso `ingest_secop.py`
+  pide el vocabulario de SECOP al arrancar en vez de adivinar la ortografía ajena.
+- Socrata devuelve **1.000 filas si no se pasa `$limit`**, sin avisar de que hay más.
 
 ---
 

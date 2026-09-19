@@ -117,11 +117,19 @@ def generar(destino: Path) -> None:
     saber.to_parquet(destino / "saber11_colegios.parquet", index=False)
 
     # --- Computadores Para Educar ------------------------------------------- #
+    # El esquema imita al real DESPUÉS de la ingesta: un registro por
+    # municipio-año, sin las columnas nacionales, y con el «niños por terminal»
+    # municipal —no el departamental—. La versión anterior de estas fixtures
+    # inventaba una columna `terminales` que no existe en la fuente, así que las
+    # pruebas pasaban sobre un esquema imaginario.
     cpe = pd.DataFrame([
         dict(anio=anio, cod_municipio=cod, municipio=nom, departamento=dep,
              ninos_por_terminal=float(rng.uniform(1, 14)),
-             terminales=int(rng.integers(0, 900)), docentes_formados=int(rng.integers(0, 200)))
-        for cod, nom, dep, cd in municipios for anio in (2019, 2021, 2023)
+             ninos_por_terminal_departamental=float(rng.uniform(2, 10)),
+             terminales_entregadas=float(rng.integers(0, 900)),
+             docentes_formados=float(rng.integers(0, 200)),
+             inversion=float(rng.integers(0, 900_000_000)))
+        for cod, nom, dep, cd in municipios for anio in (2012, 2015, 2019)
     ])
     cpe["anio"] = cpe["anio"].astype("Int64")
     cpe["cod_municipio"] = cpe["cod_municipio"].astype("string")
@@ -387,7 +395,19 @@ def main() -> int:
               f["ubicacion"]["poblados_fuera_de_la_cabecera"] == 2,
               f["ubicacion"]["poblados_fuera_de_la_cabecera"])
 
-        print("\n== 13. Economía: del departamento, nunca del municipio ==")
+        print("\n== 13. Computadores Para Educar: histórico, no estado actual ==")
+        cpe = f["computadores_para_educar"]
+        check("trae el acumulado histórico", cpe["terminales_recibidas_historico"] is not None)
+        check("y el último año con entregas", cpe["ultimo_anio_con_entregas"] == 2019,
+              cpe["ultimo_anio_con_entregas"])
+        check("advierte que es histórico, no estado actual",
+              "no el estado actual" in cpe["advertencia"])
+        check("la advertencia también viaja en la respuesta",
+              any("Computadores Para Educar" in a for a in f["advertencias"]))
+        check("niños por terminal viene con su año",
+              f["brecha_digital"]["anio_ninos_por_terminal"] is not None)
+
+        print("\n== 14. Economía: del departamento, nunca del municipio ==")
         eco = f["economia_del_departamento"]
         check("trae actividades principales", eco and len(eco["actividades_principales"]) == 3)
         check("cada una con su peso en el PIB",
@@ -396,7 +416,7 @@ def main() -> int:
         check("y la advertencia viaja en la respuesta",
               any("solo se publica por departamento" in a for a in f["advertencias"]))
 
-        print("\n== 14. Ubicar un lugar ==")
+        print("\n== 15. Ubicar un lugar ==")
         u = llamar(S.ubicar_lugar, nombre="Muni4")
         check("encuentra el municipio", u["encontrado"] and u["lugares"][0]["tipo"] == "municipio")
         check("devuelve bloque de mapa", u["vis"]["tipo"] == "mapa" and len(u["vis"]["puntos"]) > 0)
@@ -424,7 +444,7 @@ def main() -> int:
         check("sin tildes encuentra igual",
               llamar(S.ubicar_lugar, nombre="muni4")["encontrado"])
 
-        print("\n== 15. Todo lo que sale es JSON serializable ==")
+        print("\n== 16. Todo lo que sale es JSON serializable ==")
         for nombre, obj in [("ficha_municipio", f), ("ficha_colegio", fs),
                             ("senales_departamento", sd), ("contratos_municipio", k),
                             ("ubicar_lugar", rep)]:

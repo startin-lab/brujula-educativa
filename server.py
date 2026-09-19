@@ -126,6 +126,13 @@ AVISO_SENALES = (
     "Verificar con documentos antes de afirmar nada."
 )
 
+AVISO_CPE = (
+    "Computadores Para Educar es un acumulado histórico, no el estado actual del "
+    "municipio. El programa entrega a más de 1.000 municipios al año hasta 2015, a "
+    "65 en 2019, y el dataset deja de actualizarse en 2023. Sirve para saber qué se "
+    "entregó ya, no cuántos equipos hay hoy ni en qué estado."
+)
+
 AVISO_MAPA = (
     "El mapa ubica, no mide. No existe ningún indicador educativo a nivel de "
     "vereda ni de centro poblado: el dato más fino es la sede, y su ubicación "
@@ -488,6 +495,8 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
         )
     if f.get("valor_total_educacion") is not None:
         advertencias.append(AVISO_SECOP)
+    if f.get("terminales_historicas"):
+        advertencias.append(AVISO_CPE)
     if f.get("n_senales"):
         advertencias.append(AVISO_SENALES)
 
@@ -588,6 +597,18 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
             "pct_internet": redondear(f.get("pct_internet")),
             "pct_computador": redondear(f.get("pct_computador")),
             "ninos_por_terminal": redondear(f.get("ninos_por_terminal")),
+            "anio_ninos_por_terminal": (
+                int(f["anio_ninos_por_terminal"]) if f.get("anio_ninos_por_terminal") else None
+            ),
+        },
+        "computadores_para_educar": {
+            "terminales_recibidas_historico": f.get("terminales_historicas"),
+            "docentes_formados_historico": f.get("docentes_formados_historico"),
+            "inversion_historica_cop": redondear(f.get("inversion_historica"), 0),
+            "ultimo_anio_con_entregas": (
+                int(f["ultimo_anio_con_entregas"]) if f.get("ultimo_anio_con_entregas") else None
+            ),
+            "advertencia": AVISO_CPE,
         },
         "contratacion": {
             "contratos_con_objeto_educativo": f.get("n_contratos_educacion"),
@@ -1213,6 +1234,8 @@ def estado_de_los_datos() -> dict[str, Any]:
         "limitaciones_conocidas": [
             "No existe un dataset nacional abierto de planta docente de básica y media.",
             "Los microdatos con internet y computador en casa terminan en 2022.",
+            "Saber 11 solo es comparable desde 2014-2: antes era otra prueba, con otras áreas y otra escala.",
+            AVISO_CPE,
             "Ocho archivos agregados del ICFES están truncados en el servidor de origen.",
             "La cobertura viene por nivel educativo, no grado por grado.",
             AVISO_SECOP,

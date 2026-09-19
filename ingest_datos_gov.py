@@ -49,16 +49,92 @@ PAGINA = 50_000          # tope por petición que acepta Socrata
 REINTENTOS = 3
 ESPERA = 4               # segundos entre reintentos
 
+# Medido el 19/09/2026 contra la API real: una consulta departamental que va a
+# funcionar responde entre 0,4 s (caché caliente) y 12 s (frío). Si pasa de un
+# minuto no va a terminar nunca — Socrata simplemente deja la conexión abierta.
+# Un timeout de 240 s con 3 reintentos son DOCE MINUTOS perdidos en un solo
+# departamento antes de subdividirlo. Fallar rápido es lo que hace viable la
+# subdivisión adaptativa.
+TIMEOUT = 60
+
 DATASET_MEN = "nudc-7mev"
 DATASET_CPE = "pyqj-s96k"
 DATASET_SABER = "kgxf-xxbe"
 
 # Periodos de Saber 11 con cobertura nacional (calendario A). Los de primer
 # semestre traen ~15.000 estudiantes de calendario B y se incluyen aparte.
-PERIODOS_SABER = [
-    "20102", "20112", "20122", "20132", "20142", "20152",
-    "20162", "20172", "20194", "20224",
-]
+# Periodos de Saber 11 que SÍ son comparables entre sí.
+#
+# EL CORTE DE 2014 NO ES UN DETALLE TÉCNICO: ES UN EXAMEN DISTINTO.
+#
+# Verificado el 19/09/2026 consultando kgxf-xxbe periodo por periodo. El dataset
+# trae 23 periodos desde 2010, pero antes de 2014-2 la prueba tenía otra
+# estructura y otras áreas:
+#
+#   periodo   lectura   matemáticas   c. naturales   inglés   global
+#   20111     —         60.14         —              79.55    —
+#   20122     —         45            —              48       —
+#   20141     —         55            —              75       —
+#   20142     35        45            43             42       212
+#   20194     69        66            65             71       339
+#
+# Hasta 2014-1 no existen `punt_lectura_critica` ni `punt_global`: vienen nulos,
+# porque esas áreas no se evaluaban así. Y los puntajes de 2010-2011 son
+# decimales sobre otra escala —de ahí los "35,2" que revientan el cast a
+# número—, no enteros comparables con los de hoy.
+#
+# Ingerir esos periodos no produciría un error: produciría una SERIE FALSA. Un
+# municipio mostraría una "evolución" de 2010 a 2022 cuyo primer tramo mide otra
+# cosa. Para una herramienta cuyo propósito es sustentar diagnósticos, inventar
+# una tendencia es peor que no tenerla.
+#
+# Por eso la serie arranca en 2014-2 y ahí se queda.
+PERIODOS_SABER = ["20194", "20201", "20211", "20221", "20224"]
+
+# POR QUÉ CINCO PERIODOS Y NO ONCE
+#
+# Los microdatos son la fuente más lenta del proyecto: cada periodo se trocea en
+# 33 departamentos y varios se subdividen por municipio. Once periodos son horas
+# de ingesta. La pregunta correcta no es cuántos caben, sino qué aporta cada uno
+# que no esté ya en otra parte.
+#
+#   · El resultado por sede de los años recientes YA VIENE en los archivos
+#     agregados del ICFES (2021-1 a 2025-2, seis periodos usables). Reconstruirlo
+#     desde los microdatos es repetir trabajo con más latencia y más riesgo.
+#
+#   · Lo que SOLO está en los microdatos es la conectividad declarada del hogar
+#     —internet y computador—, que es la medida de brecha digital que ninguna
+#     otra fuente tiene a este detalle. Y eso se detiene en 2022.
+#
+# Quedan los dos grandes censos nacionales (20194 con 1.096.524 registros y
+# 20224 con 1.065.888) más los intermedios, que dan el antes y el después de la
+# pandemia sobre la brecha digital. 20194 es de 2019 y se sale del corte de
+# cinco años a propósito: sin él no hay con qué comparar 2022.
+
+# Los que existen pero NO se ingieren, con su razón. Se dejan escritos para que
+# nadie los "recupere" dentro de seis meses creyendo que fue un olvido.
+PERIODOS_EXCLUIDOS = {
+    "20101": "prueba anterior a la reforma de 2014",
+    "20102": "prueba anterior a la reforma de 2014",
+    "20111": "prueba anterior a la reforma de 2014; puntajes decimales en otra escala",
+    "20112": "prueba anterior a la reforma de 2014; puntajes decimales en otra escala",
+    "20121": "prueba anterior a la reforma de 2014",
+    "20122": "prueba anterior a la reforma de 2014",
+    "20131": "prueba anterior a la reforma de 2014",
+    "20132": "prueba anterior a la reforma de 2014",
+    "20141": "prueba anterior a la reforma de 2014",
+    "20151": "calendario B, ~26.000 evaluados: no da cobertura nacional",
+    "20161": "calendario B",
+    "20171": "calendario B",
+    # Fuera del alcance por decisión, no por defecto de la fuente: el resultado
+    # por sede de estos años lo cubren mejor los archivos agregados del ICFES.
+    "20142": "cubierto por los agregados del ICFES; fuera del corte de 5 años",
+    "20152": "cubierto por los agregados del ICFES; fuera del corte de 5 años",
+    "20162": "cubierto por los agregados del ICFES; fuera del corte de 5 años",
+    "20172": "cubierto por los agregados del ICFES; fuera del corte de 5 años",
+    "20181": "cubierto por los agregados del ICFES; fuera del corte de 5 años",
+    "20191": "calendario B, 12.561 evaluados",
+}
 
 AREAS = {
     "punt_lectura_critica": "prom_lectura",
@@ -75,7 +151,7 @@ def consultar(dataset: str, params: dict) -> list[dict]:
     ultimo: Exception | None = None
     for intento in range(1, REINTENTOS + 1):
         try:
-            resp = requests.get(url, params=params, timeout=240)
+            resp = requests.get(url, params=params, timeout=TIMEOUT)
             if resp.status_code == 400:
                 # Socrata devuelve el detalle del error de SoQL en el cuerpo.
                 raise RuntimeError(f"SoQL rechazado: {resp.text[:300]}")
@@ -174,16 +250,61 @@ def bajar_men() -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def bajar_cpe() -> pd.DataFrame:
+    """
+    Computadores Para Educar: qué recibió cada municipio del programa nacional.
+
+    Es el registro de «esto ya te lo dieron», que es justo lo que hace falta
+    antes de prometerle equipos a una institución. Pero el dataset tiene tres
+    trampas que lo vuelven peligroso si se lee de frente. Verificadas el
+    19/09/2026 contando valores distintos por año sobre los 1.121 municipios:
+
+    1. TRES COLUMNAS SON CIFRAS NACIONALES REPETIDAS EN CADA FILA.
+       `meta_terminales_entregadas`, `meta_docentes_formados` y
+       —la más traicionera— `sedes_beneficiadas` tienen UN SOLO valor distinto
+       en todo el país para cada año. Un municipio de Santander aparece en 2012
+       con 155 computadores entregados y, al lado, «3.889 sedes beneficiadas» y
+       una meta de 79.899 terminales. No son suyas: son del programa entero.
+       Publicarlas por municipio diría que cada uno de los 1.121 recibió lo
+       mismo que el país. Se descartan.
+
+    2. `ni_os_por_terminal` ES DEPARTAMENTAL, NO MUNICIPAL.
+       Tiene entre 33 y 35 valores distintos por año: uno por departamento. El
+       municipal es `ni_os_por_terminal_municipal`. Los nombres invitan al error
+       exacto —usar el departamental como si fuera del municipio—, así que aquí
+       se renombran para que el nombre diga lo que el dato es.
+
+    3. DESDE 2020 HAY UNA FILA POR MES, NO POR AÑO.
+       Hasta 2019 son 1.121 filas anuales, una por municipio. En 2020 son
+       11.210, en 2021 son 14.581: cortes mensuales acumulados dentro de cada
+       vigencia, más una fila basura con fecha_corte 1900-01-01. Sumarlas
+       multiplicaría lo entregado por doce. Se conserva el último corte de cada
+       municipio-año, que es el acumulado de esa vigencia.
+
+    Lo que queda es historia, no presente: el programa entrega a 832-1.106
+    municipios al año entre 2010 y 2015, baja a 354 en 2017, a 65 en 2019, y el
+    dataset deja de actualizarse en febrero de 2023.
+    """
     LOG.info("CPE (%s): descargando...", DATASET_CPE)
     df = paginar(DATASET_CPE, {"$order": "anio,coddane"})
 
+    # Cifras del programa nacional repetidas en cada fila municipal. Fuera.
+    NACIONALES = [
+        "meta_terminales_entregadas", "meta_docentes_formados",
+        "meta_padres_capacitados", "meta_retoma_de_pc", "meta_demanufactura",
+        "meta_docentes_acompa_ados", "sedes_beneficiadas",
+    ]
+    sobran = [c for c in NACIONALES if c in df.columns]
+    df = df.drop(columns=sobran)
+    LOG.info("CPE: descartadas %s columnas con cifras nacionales repetidas", len(sobran))
+
     renombres = {
         "coddane": "cod_municipio",
-        "ni_os_por_terminal": "ninos_por_terminal",
-        "ni_os_por_terminal_municipal": "ninos_por_terminal_municipal",
+        # El nombre corto es el departamental: se explicita para que nadie lo
+        # confunda con el del municipio.
+        "ni_os_por_terminal": "ninos_por_terminal_departamental",
+        "ni_os_por_terminal_municipal": "ninos_por_terminal",
         "inversi_n": "inversion",
         "docentes_acompa_ados": "docentes_acompanados",
-        "meta_docentes_acompa_ados": "meta_docentes_acompanados",
     }
     df = df.rename(columns={k: v for k, v in renombres.items() if k in df.columns})
 
@@ -196,10 +317,31 @@ def bajar_cpe() -> pd.DataFrame:
         else:
             df[col] = a_numero(df[col])
 
-    if "anio" in df.columns:
-        df["anio"] = df["anio"].astype("Int64")
+    df["anio"] = pd.to_numeric(df["anio"], errors="coerce").astype("Int64")
 
-    LOG.info("CPE: %s filas", len(df))
+    # Fila centinela del propio dataset. No es un corte real.
+    antes = len(df)
+    df = df[df["fecha_corte"].dt.year.ne(1900) | df["fecha_corte"].isna()]
+    if antes != len(df):
+        LOG.info("CPE: descartadas %s filas con fecha_corte 1900-01-01", antes - len(df))
+
+    # Un solo registro por municipio-año: el último corte de la vigencia.
+    antes = len(df)
+    df = (df.sort_values(["cod_municipio", "anio", "fecha_corte"])
+            .drop_duplicates(subset=["cod_municipio", "anio"], keep="last"))
+    if antes != len(df):
+        LOG.info("CPE: %s filas mensuales colapsadas a %s municipio-año", antes, len(df))
+
+    # Todo lo entregado en el año, venga de MinTIC o de la entidad territorial.
+    entregas = ["pc_entregados_mintic", "tabletas_mintic_estudiantes",
+                "tabletas_mintic_docentes", "pc_mintic_docentes",
+                "pc_aportados_por_et", "tabletas_aportadas_por_et"]
+    presentes = [c for c in entregas if c in df.columns]
+    df["terminales_entregadas"] = df[presentes].fillna(0).sum(axis=1) if presentes else 0
+
+    activos = int((df["terminales_entregadas"] > 0).sum())
+    LOG.info("CPE: %s municipio-año (%s con entregas), %s-%s",
+             len(df), activos, int(df["anio"].min()), int(df["anio"].max()))
     return df
 
 
@@ -251,6 +393,19 @@ def agregar_saber11(periodos: list[str]) -> pd.DataFrame:
     0,4 s con caché caliente y 11,7 s en frío. Con 33 departamentos por periodo la
     corrida completa toma minutos, no horas, y cada pieza es reintentable.
     """
+    # Una serie que mezcle pruebas distintas es peor que una serie corta: la
+    # segunda se nota, la primera no. Si alguien pide un periodo excluido, se
+    # rechaza con el motivo, no se ingiere en silencio.
+    invalidos = [p for p in periodos if p in PERIODOS_EXCLUIDOS]
+    if invalidos:
+        for p_ in invalidos:
+            LOG.error("Periodo %s excluido: %s", p_, PERIODOS_EXCLUIDOS[p_])
+        raise SystemExit(
+            "Los periodos anteriores a 2014-2 miden otra prueba y no son comparables. "
+            "Si de verdad los necesitas para un análisis aparte, sácalos en otra corrida "
+            "y no los mezcles con la serie."
+        )
+
     seleccion = ", ".join(
         [
             "cole_cod_dane_establecimiento",
@@ -297,10 +452,17 @@ def agregar_saber11(periodos: list[str]) -> pd.DataFrame:
     for periodo in periodos:
         del_periodo: list[pd.DataFrame] = []
         fallidos: list[str] = []
+        t_periodo = time.time()
 
-        for depto in deptos:
+        for i, depto in enumerate(deptos, 1):
+            # Se informa cada departamento: una corrida de varios minutos sin una
+            # sola línea de salida es indistinguible de un proceso colgado, y lo
+            # primero que hace quien la ve es matarla.
+            t0 = time.time()
             try:
                 datos = consultar_territorio(periodo, "cole_cod_depto_ubicacion", depto, seleccion, agrupacion)
+                LOG.info("  [%s/%s] %s depto %s — %s colegios en %.1fs",
+                         i, len(deptos), periodo, depto, len(datos), time.time() - t0)
             except Exception as exc:  # noqa: BLE001
                 # Los departamentos grandes (Antioquia, Valle) tienen tantos
                 # estudiantes que el motor de Socrata también se rinde con ellos.
@@ -337,14 +499,16 @@ def agregar_saber11(periodos: list[str]) -> pd.DataFrame:
         df["anio"] = int(periodo[:4])
         partes.append(df)
 
+        minutos = (time.time() - t_periodo) / 60
         if fallidos:
             LOG.error(
-                "Saber 11 %s: %s colegios, pero FALTAN %s departamentos (%s). "
+                "Saber 11 %s: %s colegios en %.1f min, pero FALTAN %s departamentos (%s). "
                 "El periodo queda incompleto; vuelve a correrlo antes de publicar.",
-                periodo, len(df), len(fallidos), ", ".join(fallidos[:5]),
+                periodo, len(df), minutos, len(fallidos), ", ".join(fallidos[:5]),
             )
         else:
-            LOG.info("Saber 11 %s: %s colegios en %s departamentos", periodo, len(df), len(deptos))
+            LOG.info("Saber 11 %s: %s colegios en %s departamentos (%.1f min)",
+                     periodo, len(df), len(deptos), minutos)
 
     if not partes:
         return pd.DataFrame()
@@ -386,7 +550,8 @@ def main() -> int:
         "--saltar", nargs="*", default=[], choices=["men", "cpe", "saber11"],
         help="Fuentes a omitir en esta corrida",
     )
-    parser.add_argument("--periodos", nargs="*", default=PERIODOS_SABER)
+    parser.add_argument("--periodos", nargs="*", default=PERIODOS_SABER,
+                        help="Periodos de Saber 11; por defecto solo los comparables (>= 2014-2)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 

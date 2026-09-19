@@ -22,8 +22,9 @@ CONTEXTO VERIFICADO (19/09/2026) — leer antes de tocar este archivo:
    los de calendario A, que son los que traen las ~14.000 sedes del país.
    El script los detecta y los salta con una advertencia en vez de reventar.
 
-3. Para los años sin archivo usable la serie se reconstruye desde los microdatos
-   de datos.gov.co. Eso lo hace ingest_datos_gov.py, no este script.
+3. Para los años sin archivo usable (2010-2022 salvo excepciones) la serie se
+   reconstruye desde los microdatos de datos.gov.co. Eso lo hace
+   ingest_datos_gov.py, no este script.
 
 Uso:
     python ingest_icfes.py --salida ./data
@@ -49,6 +50,17 @@ BASE = "https://www.icfes.gov.co/wp-content/uploads/"
 # Tamaño exacto de los archivos truncados en el servidor del ICFES.
 TAMANO_TRUNCADO = 1_048_576
 
+# Periodo -> ruta relativa en el portal del ICFES.
+# Archivos agregados del ICFES, ÚLTIMOS CINCO AÑOS (2021 en adelante).
+#
+# El recorte no pierde casi nada, y eso es medible: de los nueve periodos que se
+# dejan fuera, SIETE venían dañados en el servidor del ICFES (2012, 2016-2,
+# 2017-2, 2018, 2019-1, 2019-2, 2020-4). Los dos que sí abrían —2015-1 y
+# 2017-1— son de calendario B, con unos 350 establecimientos: no dan cobertura
+# nacional y no sirven para comparar nada.
+#
+# Lo que queda son seis periodos usables con ~14.000 sedes cada uno, suficientes
+# para medir tendencia por colegio sin tocar los microdatos.
 ARCHIVOS: dict[str, str] = {
     "2025-2": "2026/01/Resultados-Agregados-2025-2.xlsx",
     "2025-1": "2026/01/Resultados-Agregados-2025-1.xlsx",
@@ -57,17 +69,23 @@ ARCHIVOS: dict[str, str] = {
     "2022-1": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2022-1-VF.xlsx",
     "2021-4": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2021-4.xlsx",
     "2021-1": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2021-1.xlsx",
-    "2020-4": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2020-4.xlsx",
-    "2019-2": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2019-2.xlsx",
-    "2019-1": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2019-1.xlsx",
-    "2018-2": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-20181.xlsx",
-    "2017-2": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2017-2.xlsx",
-    "2017-1": "2025/02/Resultados-agregados-puntajes-promedio-saber-11-2017-1.xlsx",
-    "2016-2": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2016-2.xlsx",
-    "2015-1": "2025/02/Resultados-agregados-puntajes-promedio-Saber-11-2015-1-por-institucion-educativa.xls",
-    "2012-2": "2025/02/Tabla-resultados-agregados-saber-11-2012-instituciones-educativas.xlsx",
 }
 
+# Periodos retirados del alcance, con su razón. Quedan escritos para que dentro
+# de seis meses nadie los reponga creyendo que fue un descuido.
+ARCHIVOS_FUERA_DE_ALCANCE = {
+    "2020-4": "dañado en el servidor del ICFES",
+    "2019-2": "dañado en el servidor del ICFES",
+    "2019-1": "dañado en el servidor del ICFES",
+    "2018-2": "dañado en el servidor del ICFES",
+    "2017-2": "dañado en el servidor del ICFES",
+    "2017-1": "calendario B, ~350 establecimientos",
+    "2016-2": "dañado en el servidor del ICFES",
+    "2015-1": "calendario B, ~350 establecimientos",
+    "2012-2": "dañado en el servidor del ICFES",
+}
+
+# Esquema de salida. Todo lo demás se descarta.
 COLUMNAS_SALIDA = [
     "periodo", "anio", "semestre",
     "cod_inst", "cod_dane_sede", "nombre_sede",
@@ -80,7 +98,8 @@ COLUMNAS_SALIDA = [
     "desv_naturales", "desv_ingles",
 ]
 
-# Nombre en el Excel (normalizado) -> nombre de salida. Cubre los dos esquemas.
+# Nombre en el Excel (normalizado) -> nombre de salida.
+# Cubre los dos esquemas; lo que no aparezca queda como nulo.
 MAPEO = {
     "CODINST": "cod_inst",
     "CODIGODANE_SEDE": "cod_dane_sede",
@@ -92,7 +111,7 @@ MAPEO = {
     "NATURALEZA": "naturaleza",
     "JORNADA": "jornada",
     "EVALUADO": "evaluados",
-    "EVALUADOS": "evaluados",
+    "EVALUADOS": "evaluados",  # esquema antiguo, en plural
     "PROMLECTURACRITICA": "prom_lectura",
     "PROMMATEMATICA": "prom_matematicas",
     "PROMMATEMATICAS": "prom_matematicas",
@@ -171,10 +190,7 @@ def a_numero(serie: pd.Series) -> pd.Series:
         return pd.to_numeric(serie, errors="coerce")
     texto = serie.astype(str).str.strip()
     coma_decimal = texto.str.contains(r",\d{1,2}$", regex=True, na=False)
-    texto = texto.where(
-        ~coma_decimal,
-        texto.str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
-    )
+    texto = texto.where(~coma_decimal, texto.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
     return pd.to_numeric(texto, errors="coerce")
 
 
