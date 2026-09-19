@@ -44,6 +44,9 @@ Variables:
   BRUJULA_FOUNDRY_ENDPOINT     https://<recurso>.cognitiveservices.azure.com/
   BRUJULA_MODELO               nombre del despliegue del modelo en Foundry
   BRUJULA_TOKEN_NACIONAL       habilita las consultas de país entero
+  BRUJULA_BUZON                de dónde salen los enlaces de acceso
+  BRUJULA_SITIO                dirección pública, para armar esos enlaces
+  BRUJULA_HORAS_ENLACE         cuánto vive un enlace de acceso (72 por defecto)
   AZURE_STORAGE_CUENTA         contadores del portero (identidad administrada)
 """
 
@@ -60,6 +63,10 @@ MCP_URL = os.environ.get("BRUJULA_MCP_URL", "http://localhost:8080/sse")
 FOUNDRY = os.environ.get("BRUJULA_FOUNDRY_ENDPOINT", "")
 MODELO = os.environ.get("BRUJULA_MODELO", "")
 TOKEN_NACIONAL = os.environ.get("BRUJULA_TOKEN_NACIONAL", "")
+BUZON = os.environ.get("BRUJULA_BUZON", "brujula@startin.org.co")
+SITIO = os.environ.get("BRUJULA_SITIO", "https://brujula.startinlab.org")
+# Un enlace de acceso que no vence es una llave tirada en un buzón para siempre.
+HORAS_ENLACE = int(os.environ.get("BRUJULA_HORAS_ENLACE", "72"))
 
 # Cuántas vueltas de herramientas se permiten antes de cortar. Una pregunta
 # normal usa dos o tres. El tope existe para que un modelo que se enreda no
@@ -316,6 +323,69 @@ async def responder(pregunta: str, departamento: str, municipio: str,
 
 
 # --------------------------------------------------------------------- #
+#  Correo
+# --------------------------------------------------------------------- #
+
+def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str) -> None:
+    """
+    Manda un correo por Microsoft Graph con la identidad administrada.
+
+    No hay clave de API ni contraseña de buzón: el contenedor pide un token con
+    su propia identidad. Del lado del tenant, esa identidad tiene el permiso de
+    envío restringido por política a UN solo buzón, así que aunque este código
+    se equivocara de remitente, Exchange lo rechazaría.
+    """
+    import urllib.error
+    import urllib.request
+
+    from azure.identity import DefaultAzureCredential
+
+    credencial = DefaultAzureCredential()
+    token = credencial.get_token("https://graph.microsoft.com/.default").token
+
+    mensaje = {
+        "message": {
+            "subject": asunto,
+            "body": {"contentType": "HTML", "content": cuerpo_html},
+            "toRecipients": [{"emailAddress": {"address": destinatario}}],
+        },
+        "saveToSentItems": True,
+    }
+    peticion = urllib.request.Request(
+        f"https://graph.microsoft.com/v1.0/users/{BUZON}/sendMail",
+        data=json.dumps(mensaje).encode("utf-8"),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(peticion, timeout=30) as respuesta:
+            if respuesta.status not in (200, 202):
+                raise RuntimeError(f"Graph respondió {respuesta.status}")
+    except urllib.error.HTTPError as exc:
+        detalle = exc.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"Graph rechazó el envío ({exc.code}): {detalle}") from exc
+
+
+def correo_de_acceso(nombre: str, enlace: str) -> str:
+    saludo = f"Hola, {nombre.split()[0]}." if nombre.strip() else "Hola."
+    return f"""\
+<p>{saludo}</p>
+<p>Ya puedes usar Br&uacute;jula Educativa sin l&iacute;mite de consultas.
+   Abre este enlace desde el dispositivo en el que vayas a consultar:</p>
+<p><a href="{enlace}">Entrar a Br&uacute;jula Educativa</a></p>
+<p>El enlace sirve una sola vez y vence en {HORAS_ENLACE} horas.</p>
+<hr>
+<p style="color:#56527A;font-size:13px">
+  Br&uacute;jula Educativa es un proyecto de la Fundaci&oacute;n Startin. Es gratuito.<br>
+  Datos abiertos del Ministerio de Educaci&oacute;n, ICFES, MinTIC, DANE,
+  Computadores Para Educar, Colombia Compra Eficiente y OCDE.<br>
+  Para conocer, actualizar, rectificar o suprimir tus datos, o revocar tu
+  autorizaci&oacute;n: notificaciones@startin.org.co
+</p>"""
+
+
+# --------------------------------------------------------------------- #
 #  El servicio
 # --------------------------------------------------------------------- #
 
@@ -419,6 +489,80 @@ def crear_app():
         )
         LOG.info("Consulta atendida: %s vueltas, %.4f USD", resultado["vueltas"], usd)
         return JSONResponse({**resultado, "desde_cache": False})
+
+    @app.post("/registrar")
+    async def registrar(datos: Registro) -> JSONResponse:
+        # Sin autorización no se guarda nada. La casilla del formulario es lo
+        # que la ley pide poder probar, así que si no viene marcada no hay
+        # registro, ni siquiera "por ahora".
+        if not datos.autoriza:
+            return JSONResponse(
+                {"motivo": "Necesitamos tu autorización para tratar los datos."},
+                status_code=400,
+            )
+
+        ficha = secrets.token_urlsafe(32)
+        portero = estado["portero"]
+        try:
+            portero.almacen.guardar_registro(ficha, {
+                "nombre": datos.nombre,
+                "organizacion": datos.organizacion,
+                "correo": str(datos.correo),
+                "proposito": datos.proposito,
+                "autoriza": True,
+                "politica": datos.politica or "https://startin.org.co/privacidad/",
+                "cuando": time.time(),
+                "usado": False,
+            })
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo guardar el registro")
+            return JSONResponse(
+                {"motivo": "No pudimos guardar la solicitud. Inténtalo de nuevo."},
+                status_code=503,
+            )
+
+        enlace = f"{SITIO}/entrar?t={ficha}"
+        try:
+            enviar_correo(
+                str(datos.correo),
+                "Tu acceso a Brújula Educativa",
+                correo_de_acceso(datos.nombre, enlace),
+            )
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo enviar el correo de acceso")
+            return JSONResponse(
+                {"motivo": "Guardamos tu solicitud pero no pudimos enviarte el "
+                           "correo. Escríbenos a hola@startin.org.co."},
+                status_code=502,
+            )
+        return JSONResponse({"motivo": "Listo. Te enviamos un enlace de acceso al "
+                                       "correo; revisa también la carpeta de no deseados."})
+
+    @app.get("/entrar")
+    async def entrar(t: str = ""):
+        from fastapi.responses import RedirectResponse
+
+        portero = estado["portero"]
+        datos = None
+        try:
+            datos = portero.almacen.leer_registro(t) if t else None
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo leer el registro")
+
+        vencido = bool(datos) and (time.time() - float(datos.get("cuando", 0))
+                                   > HORAS_ENLACE * 3600)
+        if not datos or datos.get("usado") or vencido:
+            return RedirectResponse(f"{SITIO}/?acceso=caducado", status_code=303)
+
+        # La credencial se emite AQUÍ, no en el formulario: así el enlace sirve
+        # en el dispositivo donde se abra el correo, que rara vez es el mismo
+        # donde se llenó el formulario.
+        credencial = secrets.token_urlsafe(24)
+        portero.almacen.acreditar(credencial)
+        portero.almacen.marcar_registro_usado(t)
+        return RedirectResponse(f"{SITIO}/consultar.html#acceso={credencial}",
+                                status_code=303)
+
 
     return app
 

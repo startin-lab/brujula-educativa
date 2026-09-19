@@ -166,6 +166,8 @@ class AlmacenMemoria:
     """
 
     def __init__(self) -> None:
+        self._registros: dict[str, dict] = {}
+        self._acreditados: set[str] = set()
         self.gasto: dict[str, float] = {}      # día -> USD
         self.peticiones: dict[str, list[float]] = {}   # ip -> timestamps
         self.usadas: dict[str, int] = {}       # visitante -> preguntas
@@ -191,6 +193,24 @@ class AlmacenMemoria:
 
     def sumar_pregunta(self, visitante: str) -> None:
         self.usadas[visitante] = self.usadas.get(visitante, 0) + 1
+
+    # -- registro y acreditación ------------------------------------------ #
+
+    def guardar_registro(self, ficha: str, datos: dict) -> None:
+        self._registros[ficha] = datos
+
+    def leer_registro(self, ficha: str) -> dict | None:
+        return self._registros.get(ficha)
+
+    def marcar_registro_usado(self, ficha: str) -> None:
+        if ficha in self._registros:
+            self._registros[ficha] = {**self._registros[ficha], "usado": True}
+
+    def acreditar(self, visitante: str) -> None:
+        self._acreditados.add(visitante)
+
+    def esta_acreditado(self, visitante: str) -> bool:
+        return visitante in self._acreditados
 
     def leer_cache(self, clave: str) -> dict | None:
         entrada = self.cache.get(clave)
@@ -410,6 +430,37 @@ class AlmacenTablas:
     def sumar_pregunta(self, visitante: str) -> None:
         self._sumar_atomico("visitante", visitante, "n", 1)
 
+    # -- registro y acreditación ------------------------------------------ #
+
+    def guardar_registro(self, ficha: str, datos: dict) -> None:
+        self._tabla.upsert_entity({
+            "PartitionKey": "registro", "RowKey": ficha,
+            "json": json.dumps(datos, ensure_ascii=False), "guardado": time.time(),
+        })
+
+    def leer_registro(self, ficha: str) -> dict | None:
+        fila = self._leer("registro", ficha)
+        if not fila:
+            return None
+        try:
+            return json.loads(fila["json"])
+        except (KeyError, ValueError):
+            return None
+
+    def marcar_registro_usado(self, ficha: str) -> None:
+        datos = self.leer_registro(ficha)
+        if datos is not None:
+            self.guardar_registro(ficha, {**datos, "usado": True})
+
+    def acreditar(self, visitante: str) -> None:
+        self._tabla.upsert_entity({
+            "PartitionKey": "acreditado", "RowKey": visitante,
+            "desde": time.time(),
+        })
+
+    def esta_acreditado(self, visitante: str) -> bool:
+        return self._leer("acreditado", visitante) is not None
+
     def leer_cache(self, clave: str) -> dict | None:
         fila = self._leer("cache", clave)
         if not fila:
@@ -465,7 +516,8 @@ class Portero:
 
     def evaluar(self, pregunta: str, ip: str, visitante: str,
                 departamento: str = "", municipio: str = "",
-                acceso_completo: bool = False) -> Veredicto:
+                acceso_completo: bool = False,
+                registrado: bool = False) -> Veredicto:
         clave = clave_cache(pregunta, departamento, municipio)
 
         # --- 1. Límite por IP ------------------------------------------- #
@@ -519,14 +571,17 @@ class Portero:
             )
 
         # --- 4. Cuota del visitante -------------------------------------- #
-        if not acceso_completo:
+        # Registrarse levanta el tope de las diez preguntas, pero NO abre las
+        # consultas de país entero: eso sigue detrás del token nacional. Son
+        # dos permisos distintos y conviene que no se confundan.
+        if not acceso_completo and not registrado:
             usadas = self.almacen.preguntas_usadas(visitante)
             if usadas >= PREGUNTAS_LIBRES:
                 return Veredicto(
                     False,
                     f"Usaste tus {PREGUNTAS_LIBRES} consultas libres. Cuéntanos "
-                    "de qué organización eres y para qué usarás los datos, y te "
-                    "damos acceso completo.",
+                    "de qué organización eres y para qué usarás los datos y "
+                    "seguimos: el registro está en la página de inicio.",
                     402,
                 )
 
