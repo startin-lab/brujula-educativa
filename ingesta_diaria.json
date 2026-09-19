@@ -1,0 +1,87 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "comentario": "Brújula Educativa — trabajo de ingesta. Fundación Startin. Corre todos los días a las 5:00 a.m. de Bogotá y el propio script decide si le toca trabajar: si datos.gov.co no responde o el corte vigente tiene menos de CADA_DIAS días, termina en segundos. Sin claves guardadas: usa identidad administrada."
+  },
+  "parameters": {
+    "cuentaStorage": { "type": "string", "defaultValue": "stbrujulastartin" },
+    "contenedorBlob": { "type": "string", "defaultValue": "datos" },
+    "repositorio": { "type": "string", "defaultValue": "https://github.com/startin-lab/brujula-educativa.git" },
+    "entorno": {
+      "type": "string",
+      "defaultValue": "brujula-entorno",
+      "metadata": { "description": "Entorno de Container Apps ya creado para el servidor MCP." }
+    },
+    "region": { "type": "string", "defaultValue": "eastus2" },
+    "cron": {
+      "type": "string",
+      "defaultValue": "0 10 * * *",
+      "metadata": { "description": "En UTC. 10:00 UTC son las 5:00 a.m. de Bogotá. La hora NO es arbitraria: Socrata (datos.gov.co) hace mantenimiento programado en la tarde-noche del Este de EE. UU., entre las 18:00 y la 01:00 UTC, un día de cada mes. Una ingesta programada en esa franja fallaría siempre el mismo día y siempre por lo mismo. La madrugada está limpia." }
+    },
+    "cadaDias": {
+      "type": "int",
+      "defaultValue": 25,
+      "metadata": { "description": "Edad mínima del corte vigente para que valga la pena refrescarlo." }
+    }
+  },
+  "variables": {
+    "job": "brujula-ingesta-diaria",
+    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; exec bash correr_ingesta.sh"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/jobs",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('job')]",
+      "location": "[parameters('region')]",
+      "identity": { "type": "SystemAssigned" },
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('entorno'))]",
+        "configuration": {
+          "triggerType": "Schedule",
+          "scheduleTriggerConfig": {
+            "cronExpression": "[parameters('cron')]",
+            "parallelism": 1,
+            "replicaCompletionCount": 1
+          },
+          "replicaTimeout": 5400,
+          "replicaRetryLimit": 0
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "ingesta",
+              "image": "mcr.microsoft.com/devcontainers/python:3.12",
+              "command": [ "/bin/bash", "-lc" ],
+              "args": [ "[variables('arranque')]" ],
+              "resources": { "cpu": 1, "memory": "2Gi" },
+              "env": [
+                { "name": "REPO", "value": "[parameters('repositorio')]" },
+                { "name": "AZURE_STORAGE_CUENTA", "value": "[parameters('cuentaStorage')]" },
+                { "name": "CONTENEDOR", "value": "[parameters('contenedorBlob')]" },
+                { "name": "CADA_DIAS", "value": "[string(parameters('cadaDias'))]" }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('job'), 'escritor-blob')]",
+      "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('cuentaStorage'))]",
+      "dependsOn": [ "[resourceId('Microsoft.App/jobs', variables('job'))]" ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')]",
+        "principalId": "[reference(resourceId('Microsoft.App/jobs', variables('job')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "trabajo": { "type": "string", "value": "[variables('job')]" },
+    "horario": { "type": "string", "value": "[concat(parameters('cron'), ' UTC')]" }
+  }
+}

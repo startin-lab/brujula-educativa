@@ -20,7 +20,8 @@
 #   anterior.
 #
 # Variables que espera:
-#   AZURE_STORAGE_CONNECTION_STRING   dónde publicar el corte
+#   AZURE_STORAGE_CUENTA              dónde publicar el corte (identidad admin.)
+#   AZURE_STORAGE_CONNECTION_STRING   alternativa a lo anterior, con clave
 #   REPO                              (opcional) repositorio de origen
 #   SALTAR                            (opcional) pasos a omitir, separados por coma
 #                                     ej: SALTAR=icfes,saber11
@@ -104,7 +105,7 @@ fi
 echo "datos.gov.co responde (HTTP 200)"
 
 pip install --quiet --no-cache-dir \
-  pandas requests pyarrow duckdb openpyxl xlrd azure-storage-blob \
+  pandas requests pyarrow duckdb openpyxl xlrd azure-storage-blob azure-identity \
   || { echo "Falló la instalación de dependencias"; exit 1; }
 
 # --- ¿Hace falta un corte nuevo? Lo dice el manifiesto que ya está publicado.

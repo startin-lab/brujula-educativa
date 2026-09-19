@@ -168,9 +168,17 @@ def main() -> int:
         LOG.error("Falta azure-storage-blob: pip install azure-storage-blob")
         return 1
 
+    # Dos formas de identificarse, y se prefiere la primera:
+    #
+    #   1. AZURE_STORAGE_CUENTA + identidad administrada. El contenedor pide un
+    #      token con su propia identidad de Azure. No hay ninguna clave
+    #      guardada: nada que rotar y nada que se filtre en un log.
+    #   2. AZURE_STORAGE_CONNECTION_STRING. Es una clave con permiso total
+    #      sobre la cuenta; sirve para correr esto en un portátil.
+    cuenta = os.environ.get("AZURE_STORAGE_CUENTA", "")
     conexion = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
-    if not conexion:
-        LOG.error("Sin AZURE_STORAGE_CONNECTION_STRING no hay dónde subir.")
+    if not cuenta and not conexion:
+        LOG.error("Sin AZURE_STORAGE_CUENTA ni cadena de conexión no hay dónde subir.")
         return 1
 
     archivos = sorted(args.datos.glob("*.parquet")) + sorted(args.datos.glob("*.json"))
@@ -190,7 +198,18 @@ def main() -> int:
     # salió un número; una mezcla de dos corridas no sirve para eso.
     carpeta = ahora.strftime("%Y-%m-%d-%H%M")
 
-    cliente = BlobServiceClient.from_connection_string(conexion)
+    if cuenta:
+        try:
+            from azure.identity import DefaultAzureCredential
+        except ImportError:
+            LOG.error("Falta azure-identity: pip install azure-identity")
+            return 1
+        cliente = BlobServiceClient(
+            account_url=f"https://{cuenta}.blob.core.windows.net",
+            credential=DefaultAzureCredential(),
+        )
+    else:
+        cliente = BlobServiceClient.from_connection_string(conexion)
     contenedor = cliente.get_container_client(args.contenedor)
     try:
         contenedor.create_container()
