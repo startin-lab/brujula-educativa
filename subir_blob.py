@@ -40,10 +40,16 @@ LOG = logging.getLogger("blob")
 
 # Mínimos de cordura. Una corrida que produzca menos que esto está rota, aunque
 # haya terminado sin excepciones, y no puede pasar a ser el corte vigente.
+#
+# El de saber11 se agregó después de que una corrida publicara un corte con la
+# mitad de los periodos vacíos sin que nada lo marcara: las validaciones solo
+# cubrían las fuentes que ya habían fallado antes, que es la forma más común de
+# tener validaciones inútiles. Son ~11 periodos por ~14.000 sedes.
 MINIMOS = {
     "territorio_municipios.parquet": 1000,
     "territorio_centros_poblados.parquet": 7000,
     "men_municipios.parquet": 10000,
+    "saber11_colegios.parquet": 40000,
     "fichas_municipio.parquet": 1000,
     "fichas_lugar.parquet": 8000,
 }
