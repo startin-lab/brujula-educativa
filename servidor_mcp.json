@@ -1,0 +1,200 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "comentario": "Brújula Educativa — servidor MCP en Azure Container Apps. Fundación Startin. El contenedor no guarda ninguna clave: se identifica con su propia identidad administrada y el rol de lectura sobre la cuenta de Storage se asigna aparte. El rol de lectura de blobs se asigna aquí mismo, así que el despliegue deja el servidor funcionando sin pasos manuales salvo el token nacional."
+  },
+  "parameters": {
+    "cuentaStorage": {
+      "type": "string",
+      "metadata": {
+        "description": "Nombre de la cuenta de Storage donde vive el corte (solo el nombre, sin URL)."
+      },
+      "defaultValue": "stbrujulastartin"
+    },
+    "contenedorBlob": {
+      "type": "string",
+      "defaultValue": "datos",
+      "metadata": {
+        "description": "Contenedor de blobs con cortes/ y actual/."
+      }
+    },
+    "repositorio": {
+      "type": "string",
+      "defaultValue": "https://github.com/startin-lab/brujula-educativa.git"
+    },
+    "prefijo": {
+      "type": "string",
+      "defaultValue": "brujula",
+      "metadata": {
+        "description": "Prefijo para nombrar el entorno, la app y el workspace de logs."
+      }
+    },
+    "region": {
+      "type": "string",
+      "defaultValue": "eastus2",
+      "metadata": {
+        "description": "Región del servidor. Debe ser la misma de la cuenta de Storage: bajar el corte no debería cruzar regiones."
+      }
+    }
+  },
+  "variables": {
+    "workspace": "[concat(parameters('prefijo'), '-logs')]",
+    "entorno": "[concat(parameters('prefijo'), '-entorno')]",
+    "app": "[concat(parameters('prefijo'), '-mcp')]",
+    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; pip install --no-cache-dir --quiet mcp duckdb azure-storage-blob azure-identity; exec bash arrancar_servidor.sh"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('workspace')]",
+      "location": "[parameters('region')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30,
+        "workspaceCapping": {
+          "dailyQuotaGb": 1
+        }
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('entorno')]",
+      "location": "[parameters('region')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('workspace'))]"
+      ],
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('workspace')), '2022-10-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('workspace')), '2022-10-01').primarySharedKey]"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('app')]",
+      "location": "[parameters('region')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('entorno'))]"
+      ],
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('entorno'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": true,
+            "targetPort": 8080,
+            "transport": "auto",
+            "allowInsecure": false,
+            "traffic": [
+              {
+                "latestRevision": true,
+                "weight": 100
+              }
+            ]
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "servidor",
+              "image": "mcr.microsoft.com/devcontainers/python:3.12",
+              "command": [
+                "/bin/bash",
+                "-lc"
+              ],
+              "args": [
+                "[variables('arranque')]"
+              ],
+              "resources": {
+                "cpu": 0.5,
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "REPO",
+                  "value": "[parameters('repositorio')]"
+                },
+                {
+                  "name": "AZURE_STORAGE_CUENTA",
+                  "value": "[parameters('cuentaStorage')]"
+                },
+                {
+                  "name": "CONTENEDOR",
+                  "value": "[parameters('contenedorBlob')]"
+                },
+                {
+                  "name": "DATOS",
+                  "value": "/app/data"
+                },
+                {
+                  "name": "PUERTO",
+                  "value": "8080"
+                }
+              ],
+              "probes": [
+                {
+                  "type": "Startup",
+                  "tcpSocket": {
+                    "port": 8080
+                  },
+                  "initialDelaySeconds": 20,
+                  "periodSeconds": 10,
+                  "failureThreshold": 60
+                },
+                {
+                  "type": "Readiness",
+                  "tcpSocket": {
+                    "port": 8080
+                  },
+                  "periodSeconds": 20,
+                  "failureThreshold": 3
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 3
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('app'), 'lector-blob')]",
+      "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('cuentaStorage'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('app'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "url": {
+      "type": "string",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
+    "identidad": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01', 'Full').identity.principalId]"
+    }
+  }
+}

@@ -22,8 +22,24 @@
 #   Un MCP a medias es peor que uno caído: responde, y responde mal. Container
 #   Apps reintentará el arranque, que es el comportamiento correcto.
 #
+# CÓMO SE AUTENTICA CONTRA BLOB
+#
+#   Dos caminos, y se prefiere el primero:
+#
+#   1. IDENTIDAD ADMINISTRADA (AZURE_STORAGE_CUENTA). El contenedor pide un
+#      token a Azure con su propia identidad. No hay ninguna clave guardada en
+#      ningún lado: nada que rotar, nada que se filtre en un log, nada que
+#      alguien tenga que pegar a mano en un formulario. Requiere que la
+#      identidad de la app tenga el rol «Lector de datos de Storage Blob» sobre
+#      la cuenta.
+#
+#   2. CADENA DE CONEXIÓN (AZURE_STORAGE_CONNECTION_STRING). Es una clave con
+#      permiso total sobre la cuenta. Sirve para correr esto en un portátil.
+#      En producción es el camino de atrás.
+#
 # Variables:
-#   AZURE_STORAGE_CONNECTION_STRING   de dónde bajar el corte
+#   AZURE_STORAGE_CUENTA              nombre de la cuenta de Storage (identidad)
+#   AZURE_STORAGE_CONNECTION_STRING   alternativa a lo anterior, con clave
 #   BRUJULA_TOKEN_NACIONAL            habilita las consultas de país entero
 #   CONTENEDOR                        (opcional) por defecto "datos"
 #   PUERTO                            (opcional) por defecto 8080
@@ -48,10 +64,14 @@ echo "================================================================"
 
 mkdir -p "$DATOS"
 
-if [[ -z "${AZURE_STORAGE_CONNECTION_STRING:-}" ]]; then
-  echo "Sin AZURE_STORAGE_CONNECTION_STRING: se usará lo que ya haya en $DATOS"
+if [[ -z "${AZURE_STORAGE_CUENTA:-}" && -z "${AZURE_STORAGE_CONNECTION_STRING:-}" ]]; then
+  echo "Sin AZURE_STORAGE_CUENTA ni cadena de conexión: se usará lo que ya haya en $DATOS"
 else
-  echo ">>> Bajando el corte vigente de $CONTENEDOR/actual/"
+  if [[ -n "${AZURE_STORAGE_CUENTA:-}" ]]; then
+    echo ">>> Bajando el corte vigente de $CONTENEDOR/actual/ (identidad administrada)"
+  else
+    echo ">>> Bajando el corte vigente de $CONTENEDOR/actual/ (cadena de conexión)"
+  fi
   python3 - <<'PY'
 import os, sys
 from pathlib import Path
@@ -59,7 +79,18 @@ from azure.storage.blob import BlobServiceClient
 
 destino = Path(os.environ.get("DATOS", "/app/data"))
 contenedor = os.environ.get("CONTENEDOR", "datos")
-cliente = BlobServiceClient.from_connection_string(os.environ["AZURE_STORAGE_CONNECTION_STRING"])
+
+cuenta = os.environ.get("AZURE_STORAGE_CUENTA", "")
+if cuenta:
+    # Sin claves: el contenedor se identifica con su propia identidad de Azure.
+    from azure.identity import DefaultAzureCredential
+    cliente = BlobServiceClient(
+        account_url=f"https://{cuenta}.blob.core.windows.net",
+        credential=DefaultAzureCredential(),
+    )
+else:
+    cliente = BlobServiceClient.from_connection_string(
+        os.environ["AZURE_STORAGE_CONNECTION_STRING"])
 cc = cliente.get_container_client(contenedor)
 
 bajados = 0
