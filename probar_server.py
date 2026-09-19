@@ -74,8 +74,12 @@ def generar(destino: Path) -> None:
             # resto de indicadores. Es el hueco que no puede convertirse en cero.
             if anio > 2022 and int(cod[-1]) % 2 == 0:
                 desercion = np.nan
+            # El MEN publica el mismo municipio con y sin cero a la izquierda
+            # según el año. Se reproduce el defecto a propósito: si la ingesta
+            # o las fichas dejan de normalizar, estas pruebas tienen que gritar.
+            cod_crudo = cod.lstrip("0") if (anio % 2 == 0 and nom.endswith("4")) else cod
             filas.append(dict(
-                anio=anio, cod_municipio=cod, municipio=nom, departamento=dep,
+                anio=anio, cod_municipio=cod_crudo, municipio=nom, departamento=dep,
                 cod_departamento=cd, cobertura_neta=cobertura, cobertura_bruta=cobertura + 8,
                 desercion=desercion, aprobacion=float(rng.uniform(80, 97)),
                 reprobacion=float(rng.uniform(2, 12)), repitencia=float(rng.uniform(1, 6)),
@@ -84,7 +88,7 @@ def generar(destino: Path) -> None:
             ))
     men = pd.DataFrame(filas)
     men["anio"] = men["anio"].astype("Int64")
-    men["cod_municipio"] = men["cod_municipio"].astype("string")
+    men["cod_municipio"] = men["cod_municipio"].astype("string")   # sin rellenar
     men["desercion_sospechosa"] = (men["desercion"] == 0) & (men["cobertura_neta"] < 80)
     men.to_parquet(destino / "men_municipios.parquet", index=False)
 
@@ -311,6 +315,20 @@ def main() -> int:
               all(s["explicacion"] != s["clave"] for s in f["senales"]))
         check("municipio inexistente no inventa",
               llamar(S.ficha_municipio, municipio="Macondo", departamento="ANTIOQUIA")["encontrado"] is False)
+
+        print("\n== 3b. Un código sin cero a la izquierda no parte el municipio ==")
+        fm = pd.read_parquet(datos / "fichas_municipio.parquet")
+        check("hay una ficha por municipio, no dos",
+              len(fm) == fm["municipio"].nunique() == 40, (len(fm), fm["municipio"].nunique()))
+        check("todos los códigos quedaron con cinco dígitos",
+              bool(fm["cod_municipio"].str.len().eq(5).all()),
+              sorted(fm["cod_municipio"].str.len().unique()))
+        m4 = fm[fm.municipio == "Muni4"].iloc[0]
+        check("el municipio afectado conserva sus coordenadas",
+              pd.notna(m4["lat"]) and pd.notna(m4["lon"]))
+        check("y sus resultados de Saber 11", pd.notna(m4["prom_matematicas"]))
+        check("y su histórico de Computadores Para Educar",
+              pd.notna(m4["terminales_historicas"]))
 
         print("\n== 4. Muestra pequeña: no se publica promedio ==")
         sede_peq = pd.read_parquet(datos / "fichas_sede.parquet").query("~muestra_suficiente")

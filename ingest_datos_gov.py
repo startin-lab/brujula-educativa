@@ -187,6 +187,36 @@ def paginar(dataset: str, params: dict) -> pd.DataFrame:
     return pd.DataFrame(filas)
 
 
+def codigo_municipio(serie: pd.Series) -> pd.Series:
+    """
+    Código DANE municipal a cinco dígitos, siempre.
+
+    EL MEN PUBLICA EL MISMO MUNICIPIO CON DOS CÓDIGOS DISTINTOS. Verificado el
+    19/09/2026: Abejorral aparece como "5002" y como "05002" en el mismo
+    dataset, según el año. De los 1.272 códigos distintos que trae, 149 vienen
+    sin el cero a la izquierda.
+
+    Ninguna otra fuente tiene el problema: DIVIPOLA, Computadores Para Educar y
+    Saber 11 usan los cinco dígitos. El MEN es la excepción, y es justo el que
+    define el universo de municipios y sirve de llave para todo lo demás.
+
+    Sin normalizar, esos 149 municipios —el 13 % del país— se parten en dos:
+    dos fichas con la mitad de los años cada una, y la variante sin rellenar no
+    cruza con las coordenadas, ni con Saber 11, ni con CPE. No falla con un
+    error: entrega un municipio a medias y se ve como si el dato no existiera.
+    """
+    return (serie.astype("string").str.strip()
+            .str.replace(r"\.0$", "", regex=True)
+            .str.zfill(5))
+
+
+def codigo_departamento(serie: pd.Series) -> pd.Series:
+    """Igual que el municipal, a dos dígitos."""
+    return (serie.astype("string").str.strip()
+            .str.replace(r"\.0$", "", regex=True)
+            .str.zfill(2))
+
+
 def a_numero(serie: pd.Series) -> pd.Series:
     """
     Normaliza número tolerando coma decimal colombiana. Lo que no convierte
@@ -233,6 +263,16 @@ def bajar_men() -> pd.DataFrame:
             df[col] = df[col].astype("string").str.strip()
         elif col != "anio":
             df[col] = a_numero(df[col])
+
+    # Antes de cualquier agrupación: si no, el mismo municipio cuenta dos veces.
+    antes = df["cod_municipio"].nunique()
+    df["cod_municipio"] = codigo_municipio(df["cod_municipio"])
+    if "cod_departamento" in df.columns:
+        df["cod_departamento"] = codigo_departamento(df["cod_departamento"])
+    fusionados = antes - df["cod_municipio"].nunique()
+    if fusionados:
+        LOG.info("MEN: %s códigos municipales sin cero a la izquierda unificados "
+                 "(%s códigos distintos -> %s)", fusionados, antes, df["cod_municipio"].nunique())
     df["anio"] = pd.to_numeric(df["anio"], errors="coerce").astype("Int64")
 
     # Un 0 % de deserción en un municipio con cobertura baja casi siempre es un
@@ -318,6 +358,7 @@ def bajar_cpe() -> pd.DataFrame:
             df[col] = a_numero(df[col])
 
     df["anio"] = pd.to_numeric(df["anio"], errors="coerce").astype("Int64")
+    df["cod_municipio"] = codigo_municipio(df["cod_municipio"])
 
     # Fila centinela del propio dataset. No es un corte real.
     antes = len(df)
@@ -525,8 +566,9 @@ def agregar_saber11(periodos: list[str]) -> pd.DataFrame:
         }
     )
 
-    for col in ["cod_dane_sede", "cod_municipio"]:
-        df[col] = df[col].astype("string").str.strip()
+    # El código de sede tiene doce dígitos y no se rellena; el municipal, cinco.
+    df["cod_dane_sede"] = df["cod_dane_sede"].astype("string").str.strip()
+    df["cod_municipio"] = codigo_municipio(df["cod_municipio"])
     for col in ["evaluados", "con_internet", "con_computador", *AREAS.values()]:
         df[col] = a_numero(df[col])
 

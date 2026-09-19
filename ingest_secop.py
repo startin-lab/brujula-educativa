@@ -186,8 +186,15 @@ def municipios_men() -> list[tuple[str, str, str]]:
       · La fila NACIONAL. El MEN publica un agregado del país como si fuera un
         municipio más. Sin filtrarlo se consultarían en SECOP los contratos de
         un municipio llamado «NACIONAL».
-      · Duplicados por código. Un municipio cuyo nombre cambió de grafía entre
-        vigencias aparece dos veces. Se queda la grafía más reciente.
+      · Duplicados por código. Y son de dos clases distintas:
+
+          - Grafía del nombre que cambió entre vigencias. Se queda la más reciente.
+          - EL MISMO MUNICIPIO CON DOS CÓDIGOS. El MEN publica Abejorral como
+            "5002" y como "05002" según el año; 149 de sus 1.272 códigos vienen
+            sin el cero a la izquierda. Sin normalizar a cinco dígitos, esos 149
+            municipios se consultan DOS VECES contra SECOP —el doble de tiempo
+            en el tramo más lento— y entran duplicados al parquet, donde después
+            se suman dos veces en las fichas.
     """
     datos = consultar(DATASET_MEN, {
         "$select": "c_digo_municipio, municipio, departamento",
@@ -195,15 +202,19 @@ def municipios_men() -> list[tuple[str, str, str]]:
         "$limit": LIMITE_SOCRATA,
     })
     vistos: dict[str, tuple[str, str, str]] = {}
+    crudos = 0
     for d in datos:
-        codigo = str(d.get("c_digo_municipio") or "").strip()
+        codigo = str(d.get("c_digo_municipio") or "").strip().removesuffix(".0")
         nombre = (d.get("municipio") or "").strip()
         if not codigo or not nombre or normalizar(nombre) == "NACIONAL":
             continue
+        crudos += 1
+        codigo = codigo.zfill(5)   # "5002" y "05002" son el mismo municipio
         vistos[codigo] = (codigo, nombre, (d.get("departamento") or "").strip())
 
     filas = sorted(vistos.values(), key=lambda x: x[1])
-    LOG.info("MEN: %s municipios para cruzar contra SECOP", len(filas))
+    LOG.info("MEN: %s filas -> %s municipios únicos para cruzar contra SECOP",
+             crudos, len(filas))
     return filas
 
 

@@ -248,6 +248,17 @@ dentro de seis meses creyendo que fueron un olvido.
   `Bogotá D.C.`, mientras el MEN la llama `Bogotá, D.C.`. Por eso `ingest_secop.py`
   pide el vocabulario de SECOP al arrancar en vez de adivinar la ortografía ajena.
 - Socrata devuelve **1.000 filas si no se pasa `$limit`**, sin avisar de que hay más.
+- **El MEN publica el mismo municipio con dos códigos distintos.** Abejorral
+  aparece como `"5002"` y como `"05002"` en el mismo dataset, según el año: 149
+  de sus 1.272 códigos vienen sin el cero a la izquierda. Ninguna otra fuente
+  tiene el problema —DIVIPOLA, CPE y Saber 11 usan los cinco dígitos—, y el MEN
+  es justo el que define el universo de municipios y sirve de llave para todo lo
+  demás. Sin normalizar, esos 149 municipios (**el 13 % del país**) se parten en
+  dos fichas con la mitad de los años cada una, y la variante sin rellenar no
+  cruza con coordenadas, ni con Saber 11, ni con CPE. No falla con un error:
+  entrega el municipio a medias y se ve como si el dato no existiera. Se rellena
+  en la ingesta, al construir las fichas **y** al levantar el servidor: son tres
+  puntos distintos donde puede entrar un parquet de otra corrida.
 
 ---
 

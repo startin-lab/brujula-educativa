@@ -183,6 +183,21 @@ def conexion() -> duckdb.DuckDBPyConnection:
             ruta = _datos / archivo
             if ruta.exists():
                 _con.execute(f"CREATE VIEW {vista} AS SELECT * FROM read_parquet('{ruta}')")
+                # Los códigos DANE se rellenan aquí también, no solo en la
+                # ingesta: el MEN publica el mismo municipio como "5002" y
+                # "05002" según el año, y un código sin rellenar no cruza con
+                # nada. No da error; hace desaparecer años enteros de una serie.
+                columnas = {c[0] for c in _con.execute(f"DESCRIBE {vista}").fetchall()}
+                anchos = {c: n for c, n in (("cod_municipio", 5), ("cod_departamento", 2))
+                          if c in columnas}
+                if anchos:
+                    rellenos = ", ".join(f"lpad(CAST({c} AS VARCHAR), {n}, '0') AS {c}"
+                                         for c, n in anchos.items())
+                    _con.execute(
+                        f"CREATE OR REPLACE VIEW {vista} AS "
+                        f"SELECT * EXCLUDE ({', '.join(anchos)}), {rellenos} "
+                        f"FROM read_parquet('{ruta}')"
+                    )
                 LOG.info("Vista %s lista desde %s", vista, archivo)
             else:
                 LOG.warning("Falta %s — las herramientas que lo usan responderán sin datos", archivo)

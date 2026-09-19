@@ -147,8 +147,10 @@ def bajar_municipios() -> pd.DataFrame:
         "cod_dpto": "cod_departamento", "dpto": "departamento",
         "cod_mpio": "cod_municipio", "nom_mpio": "municipio",
     })
-    for col in ("cod_departamento", "cod_municipio"):
-        df[col] = df[col].astype("string").str.strip()
+    # DIVIPOLA ya trae los cinco dígitos, pero se rellena igual: es la llave con
+    # la que cruzan todas las fuentes y no vale la pena confiar en que siga así.
+    df["cod_municipio"] = df["cod_municipio"].astype("string").str.strip().str.zfill(5)
+    df["cod_departamento"] = df["cod_departamento"].astype("string").str.strip().str.zfill(2)
     df["lat"] = a_coordenada(df["latitud"])
     df["lon"] = a_coordenada(df["longitud"])
     df = df.drop(columns=["latitud", "longitud"])
@@ -195,6 +197,8 @@ def bajar_centros_poblados() -> pd.DataFrame:
     })
     for col in ("cod_departamento", "cod_municipio", "cod_lugar"):
         df[col] = df[col].astype("string").str.strip()
+    df["cod_municipio"] = df["cod_municipio"].str.zfill(5)
+    df["cod_departamento"] = df["cod_departamento"].str.zfill(2)
     df["lat"] = a_coordenada(df["latitud"])
     df["lon"] = a_coordenada(df["longitud"])
     df = df.drop(columns=["latitud", "longitud"])

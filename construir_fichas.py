@@ -86,6 +86,23 @@ def registrar(con: duckdb.DuckDBPyConnection, datos: Path) -> dict[str, bool]:
         presentes[clave] = ruta.exists()
         if ruta.exists():
             con.execute(f"CREATE OR REPLACE VIEW {clave} AS SELECT * FROM read_parquet('{ruta}')")
+            # Cinturón además de tirantes: la ingesta ya rellena los códigos,
+            # pero las fichas se construyen sobre parquet que pueden venir de
+            # otra corrida o de otra mano. Un código sin cero a la izquierda no
+            # cruza con nada y no lanza ningún error: parte el municipio en dos.
+            columnas = {c[0] for c in con.execute(f"DESCRIBE {clave}").fetchall()}
+            anchos = {"cod_municipio": 5, "cod_departamento": 2}
+            a_rellenar = {c: n for c, n in anchos.items() if c in columnas}
+            if a_rellenar:
+                rellenos = ", ".join(
+                    f"lpad(CAST({c} AS VARCHAR), {n}, '0') AS {c}"
+                    for c, n in a_rellenar.items()
+                )
+                con.execute(
+                    f"CREATE OR REPLACE VIEW {clave} AS "
+                    f"SELECT * EXCLUDE ({', '.join(a_rellenar)}), {rellenos} "
+                    f"FROM read_parquet('{ruta}')"
+                )
             n = con.execute(f"SELECT count(*) FROM {clave}").fetchone()[0]
             LOG.info("  %-8s %8s filas  (%s)", clave, f"{n:,}".replace(",", "."), archivo)
         else:
