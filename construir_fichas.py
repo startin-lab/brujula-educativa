@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""
+Brújula Educativa — Construcción de fichas precalculadas
+Fundación Startin
+
+Convierte los parquet crudos de la ingesta en dos tablas que ya traen la
+respuesta hecha: una ficha por municipio y una ficha por sede.
+
+POR QUÉ FICHAS Y NO CONSULTAS EN VIVO
+
+  El agente no debe agregar millones de filas cada vez que alguien pregunta por
+  Soacha. Con fichas, responder es una búsqueda por clave: costo casi nulo,
+  latencia de milisegundos y —lo que más importa— la misma cifra para la misma
+  pregunta, hoy y en tres meses. Un diagnóstico que cambia de número entre dos
+  reuniones no sirve para sustentar nada.
+
+  La ingesta se corre una vez al mes. Las fichas se reconstruyen después. Entre
+  corridas, todo lo que el agente dice es reproducible y tiene fecha de corte.
+
+QUÉ ES UNA FICHA
+
+  No es un volcado de indicadores. Es el material de un diagnóstico previo:
+  cobertura, deserción, resultados, brecha digital, contratación, y encima
+  SEÑALES — puntos donde el dato público y lo que una institución suele afirmar
+  no coinciden. Las señales no acusan a nadie; marcan dónde mirar.
+
+CÓMO SE COMPARA
+
+  Siempre dentro del departamento, nunca contra el país. Comparar un colegio de
+  Guainía con el promedio nacional no informa: lo compara contra Bogotá. La
+  posición relativa que sirve para focalizar esfuerzos es la que se mide entre
+  pares del mismo territorio.
+
+Uso:
+    python construir_fichas.py --datos ./data --salida ./data
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from datetime import date
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+
+LOG = logging.getLogger("fichas")
+
+# Una sede con pocos evaluados no admite promedio publicable ni comparación.
+MUESTRA_MINIMA = 10
+
+# Periodos que se miran para juzgar una tendencia. Menos de tres es ruido.
+PERIODOS_TENDENCIA = 3
+
+# Umbrales de señal. Son convenciones de trabajo de la fundación, no normas
+# oficiales; van declaradas en los metadatos para que nadie los lea como ley.
+UMBRAL_COBERTURA_BAJA = 80.0      # cobertura neta, %
+UMBRAL_DESERCION_ALTA = 5.0       # deserción, %
+UMBRAL_INTERNET_BAJO = 40.0       # hogares con internet, %
+UMBRAL_CAIDA_PUNTOS = 5.0         # puntos de caída sostenida en Saber 11
+
+ARCHIVOS = {
+    "men": "men_municipios.parquet",
+    "cpe": "computadores_educar.parquet",
+    "saber11": "saber11_colegios.parquet",
+    "icfes": "saber11_agregado.parquet",
+    "secop": "secop_municipios.parquet",
+    "geo_mun": "territorio_municipios.parquet",
+    "geo_cp": "territorio_centros_poblados.parquet",
+    "economia": "economia_resumen.parquet",
+}
+
+
+def registrar(con: duckdb.DuckDBPyConnection, datos: Path) -> dict[str, bool]:
+    """
+    Crea una vista por archivo disponible. Las fuentes que falten no tumban la
+    corrida: una ficha con menos fuentes sigue sirviendo, una corrida abortada
+    no sirve de nada. Lo que falta queda anotado en los metadatos.
+    """
+    presentes: dict[str, bool] = {}
+    for clave, archivo in ARCHIVOS.items():
+        ruta = datos / archivo
+        presentes[clave] = ruta.exists()
+        if ruta.exists():
+            con.execute(f"CREATE OR REPLACE VIEW {clave} AS SELECT * FROM read_parquet('{ruta}')")
+            n = con.execute(f"SELECT count(*) FROM {clave}").fetchone()[0]
+            LOG.info("  %-8s %8s filas  (%s)", clave, f"{n:,}".replace(",", "."), archivo)
+        else:
+            LOG.warning("  %-8s AUSENTE            (%s)", clave, archivo)
+    return presentes
+
+
+# --------------------------------------------------------------------------- #
+# Ficha municipal
+# --------------------------------------------------------------------------- #
+
+SQL_MEN_ULTIMO = """
+-- Último año con dato POR INDICADOR, no por municipio. El MEN publica filas
+-- incompletas: un municipio puede tener cobertura 2024 y deserción solo hasta
+-- 2022. Tomar "la fila más reciente" devolvería nulos donde sí hay dato.
+CREATE OR REPLACE TABLE men_ultimo AS
+WITH base AS (
+    SELECT cod_municipio, municipio, departamento, cod_departamento, anio,
+           cobertura_neta, cobertura_bruta, desercion, aprobacion, reprobacion,
+           repitencia, tasa_matriculacion, poblacion_5_16, desercion_sospechosa
+    FROM men
+    WHERE cod_municipio IS NOT NULL
+)
+SELECT
+    cod_municipio,
+    any_value(municipio      ORDER BY anio DESC)      AS municipio,
+    any_value(departamento   ORDER BY anio DESC)      AS departamento,
+    any_value(cod_departamento ORDER BY anio DESC)    AS cod_departamento,
+    max(anio)                                          AS anio_men,
+    arg_max(cobertura_neta,      anio) FILTER (cobertura_neta      IS NOT NULL) AS cobertura_neta,
+    arg_max(cobertura_bruta,     anio) FILTER (cobertura_bruta     IS NOT NULL) AS cobertura_bruta,
+    arg_max(desercion,           anio) FILTER (desercion           IS NOT NULL) AS desercion,
+    arg_max(aprobacion,          anio) FILTER (aprobacion          IS NOT NULL) AS aprobacion,
+    arg_max(reprobacion,         anio) FILTER (reprobacion         IS NOT NULL) AS reprobacion,
+    arg_max(repitencia,          anio) FILTER (repitencia          IS NOT NULL) AS repitencia,
+    arg_max(tasa_matriculacion,  anio) FILTER (tasa_matriculacion  IS NOT NULL) AS tasa_matriculacion,
+    arg_max(poblacion_5_16,      anio) FILTER (poblacion_5_16      IS NOT NULL) AS poblacion_5_16,
+    arg_max(anio, anio) FILTER (desercion IS NOT NULL)              AS anio_desercion,
+    -- Cuántos años ha reportado 0 % de deserción teniendo cobertura baja.
+    -- Un año puede ser un traspié de reporte; cinco seguidos es un patrón.
+    count(*) FILTER (WHERE desercion_sospechosa)                    AS anios_desercion_cero
+FROM base
+GROUP BY cod_municipio
+"""
+
+SQL_SABER_MUNICIPIO = """
+-- Resultados agregados al municipio desde los microdatos por colegio. Se
+-- ponderan por evaluados: el promedio de promedios le daría el mismo peso a un
+-- colegio de 12 estudiantes que a uno de 600.
+CREATE OR REPLACE TABLE saber_municipio AS
+WITH ultimo AS (SELECT max(periodo) AS p FROM saber11)
+SELECT
+    s.cod_municipio,
+    (SELECT p FROM ultimo)                                            AS periodo_saber,
+    count(*)                                                          AS sedes_evaluadas,
+    sum(s.evaluados)                                                  AS evaluados,
+    round(sum(s.prom_lectura     * s.evaluados) / sum(s.evaluados), 1) AS prom_lectura,
+    round(sum(s.prom_matematicas * s.evaluados) / sum(s.evaluados), 1) AS prom_matematicas,
+    round(sum(s.prom_naturales   * s.evaluados) / sum(s.evaluados), 1) AS prom_naturales,
+    round(sum(s.prom_sociales    * s.evaluados) / sum(s.evaluados), 1) AS prom_sociales,
+    round(sum(s.prom_ingles      * s.evaluados) / sum(s.evaluados), 1) AS prom_ingles,
+    round(sum(s.con_internet)    * 100.0 / sum(s.evaluados), 1)        AS pct_internet,
+    round(sum(s.con_computador)  * 100.0 / sum(s.evaluados), 1)        AS pct_computador
+FROM saber11 s, ultimo
+WHERE s.periodo = ultimo.p AND s.evaluados > 0
+GROUP BY s.cod_municipio
+"""
+
+SQL_CPE_ULTIMO = """
+CREATE OR REPLACE TABLE cpe_ultimo AS
+SELECT
+    cod_municipio,
+    max(anio)                                     AS anio_cpe,
+    arg_max(ninos_por_terminal, anio) FILTER (ninos_por_terminal IS NOT NULL) AS ninos_por_terminal,
+    sum(COALESCE(terminales, 0))                  AS terminales_entregadas,
+    sum(COALESCE(docentes_formados, 0))           AS docentes_formados
+FROM cpe
+WHERE cod_municipio IS NOT NULL
+GROUP BY cod_municipio
+"""
+
+
+def columnas_de(con: duckdb.DuckDBPyConnection, vista: str) -> set[str]:
+    return {r[0] for r in con.execute(f"DESCRIBE {vista}").fetchall()}
+
+
+def construir_municipios(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -> pd.DataFrame:
+    if not hay["men"]:
+        raise SystemExit("men_municipios.parquet es obligatorio: define el universo de municipios.")
+
+    # El MEN cambia columnas entre vigencias. Se rellena lo ausente con NULL en
+    # vez de fallar: perder un indicador es aceptable, perder la corrida no.
+    presentes = columnas_de(con, "men")
+    esperadas = ["cobertura_neta", "cobertura_bruta", "desercion", "aprobacion", "reprobacion",
+                 "repitencia", "tasa_matriculacion", "poblacion_5_16", "cod_departamento",
+                 "desercion_sospechosa"]
+    faltantes = [c for c in esperadas if c not in presentes]
+    if faltantes:
+        LOG.warning("MEN sin columnas %s — se rellenan con NULL", ", ".join(faltantes))
+        tipo = {"desercion_sospechosa": "BOOLEAN", "cod_departamento": "VARCHAR"}
+        extra = ", ".join(f"CAST(NULL AS {tipo.get(c, 'DOUBLE')}) AS {c}" for c in faltantes)
+        con.execute(f"CREATE OR REPLACE VIEW men AS SELECT *, {extra} FROM men")
+
+    con.execute(SQL_MEN_ULTIMO)
+    if hay["saber11"]:
+        con.execute(SQL_SABER_MUNICIPIO)
+    if hay["cpe"]:
+        con.execute(SQL_CPE_ULTIMO)
+
+    joins, campos = [], []
+    if hay["saber11"]:
+        joins.append("LEFT JOIN saber_municipio s USING (cod_municipio)")
+        campos.append("s.periodo_saber, s.sedes_evaluadas, s.evaluados, s.prom_lectura, "
+                      "s.prom_matematicas, s.prom_naturales, s.prom_sociales, s.prom_ingles, "
+                      "s.pct_internet, s.pct_computador")
+    if hay["cpe"]:
+        joins.append("LEFT JOIN cpe_ultimo c USING (cod_municipio)")
+        campos.append("c.anio_cpe, c.ninos_por_terminal, c.terminales_entregadas, c.docentes_formados")
+    if hay["secop"]:
+        joins.append("LEFT JOIN secop k USING (cod_municipio)")
+        campos.append("k.n_contratos_educacion, k.valor_total_educacion")
+    if hay["geo_mun"]:
+        # Dónde queda, a qué distancia de su capital y de Bogotá, y si es
+        # municipio propiamente dicho o área no municipalizada.
+        joins.append("LEFT JOIN geo_mun g USING (cod_municipio)")
+        campos.append("g.lat, g.lon, g.km_a_capital, g.km_a_bogota, "
+                      "g.capital_departamento, g.tipo_municipio")
+
+    extra = (", " + ", ".join(campos)) if campos else ""
+    df = con.execute(f"SELECT m.* {extra} FROM men_ultimo m {' '.join(joins)}").fetchdf()
+
+    # ------------------------------------------------------------------ #
+    # Contexto territorial
+    # ------------------------------------------------------------------ #
+    if hay["geo_cp"]:
+        # Poblados con nombre propio APARTE de la cabecera: una primera medida
+        # de qué tan disperso es el territorio que habría que cubrir. La cabecera
+        # se excluye porque es el municipio mismo; contarla inflaría a todos por
+        # igual y no distinguiría un municipio compacto de uno regado.
+        cp = con.execute("""
+            SELECT cod_municipio, count(*) AS poblados_fuera_de_la_cabecera
+            FROM geo_cp WHERE tipo <> 'cabecera municipal'
+            GROUP BY cod_municipio
+        """).fetchdf()
+        df = df.merge(cp, on="cod_municipio", how="left")
+        df["poblados_fuera_de_la_cabecera"] = (
+            df["poblados_fuera_de_la_cabecera"].fillna(0).astype(int)
+        )
+
+    if hay["saber11"]:
+        # Sedes rurales sobre el total: es la cifra que cambia de raíz lo que
+        # significa "cobertura" en un municipio.
+        zonas = con.execute("""
+            WITH ultimo AS (SELECT max(periodo) AS p FROM saber11)
+            SELECT cod_municipio,
+                   count(*) AS sedes_total,
+                   count(*) FILTER (WHERE upper(zona) LIKE 'RURAL%') AS sedes_rurales
+            FROM saber11, ultimo
+            WHERE periodo = ultimo.p AND cod_municipio IS NOT NULL
+            GROUP BY cod_municipio
+        """).fetchdf()
+        df = df.merge(zonas, on="cod_municipio", how="left")
+        df["pct_sedes_rurales"] = (
+            df["sedes_rurales"] / df["sedes_total"].where(df["sedes_total"] > 0) * 100
+        ).round(1)
+
+    # ------------------------------------------------------------------ #
+    # Contexto económico — SIEMPRE del departamento, nunca del municipio
+    # ------------------------------------------------------------------ #
+    if hay["economia"]:
+        # El PIB solo se publica por departamento. Atribuirlo a un municipio
+        # sería inventar, así que viaja con el nombre del departamento pegado y
+        # la ficha lo presenta como contexto regional, no como cifra local.
+        eco = con.execute("""
+            SELECT cod_departamento, anio_pib, pib_miles_millones,
+                   actividades_principales, pct_actividades_principales,
+                   sector_dominante
+            FROM economia
+        """).fetchdf()
+        df = df.merge(eco, on="cod_departamento", how="left")
+
+    # ------------------------------------------------------------------ #
+    # Posición relativa dentro del departamento
+    # ------------------------------------------------------------------ #
+    if "prom_matematicas" in df.columns:
+        grupo = df.groupby("departamento")["prom_matematicas"]
+        df["mediana_depto_matematicas"] = grupo.transform("median").round(1)
+        # Percentil dentro del departamento. Con menos de cinco municipios con
+        # dato el percentil es aritmética sin significado: se deja nulo.
+        con_dato = grupo.transform("count")
+        df["percentil_depto"] = (grupo.rank(pct=True) * 100).round(0)
+        df.loc[con_dato < 5, "percentil_depto"] = pd.NA
+
+    # ------------------------------------------------------------------ #
+    # Contratación por habitante en edad escolar
+    # ------------------------------------------------------------------ #
+    if "valor_total_educacion" in df.columns and "poblacion_5_16" in df.columns:
+        # NO es inversión educativa per cápita. SECOP registra el municipio de la
+        # ENTIDAD que contrata, no dónde se ejecutó el gasto: los contratos de
+        # entidades nacionales con sede en Bogotá caen todos en Bogotá. Sirve
+        # como orden de magnitud para abrir una conversación, nunca como cifra.
+        df["contratacion_por_menor"] = (
+            df["valor_total_educacion"] / df["poblacion_5_16"].where(df["poblacion_5_16"] > 0)
+        ).round(0)
+        # Referencia departamental. Sin ella el "contraste" solo miraría un lado.
+        df["mediana_depto_contratacion"] = (
+            df.groupby("departamento")["contratacion_por_menor"].transform("median").round(0)
+        )
+
+    # ------------------------------------------------------------------ #
+    # Señales — dónde mirar, no qué concluir
+    # ------------------------------------------------------------------ #
+    senales: list[list[str]] = []
+    hoy = date.today().year
+    for fila in df.itertuples():
+        s: list[str] = []
+        # Se juzga por el dato vigente, no por cualquier año del histórico:
+        # un municipio que corrigió su reporte no debe cargar la marca para
+        # siempre. El histórico queda aparte, en anios_desercion_cero.
+        if pd.notna(getattr(fila, "desercion", None)) and fila.desercion == 0 \
+                and pd.notna(getattr(fila, "cobertura_neta", None)) \
+                and fila.cobertura_neta < UMBRAL_COBERTURA_BAJA:
+            s.append("desercion_cero_con_cobertura_baja")
+        anio_men = getattr(fila, "anio_men", None)
+        if pd.notna(anio_men) and hoy - int(anio_men) >= 3:
+            s.append("sin_reporte_men_reciente")
+        cob = getattr(fila, "cobertura_neta", None)
+        if pd.notna(cob) and cob < UMBRAL_COBERTURA_BAJA:
+            s.append("cobertura_neta_baja")
+        des = getattr(fila, "desercion", None)
+        if pd.notna(des) and des > UMBRAL_DESERCION_ALTA:
+            s.append("desercion_alta")
+        net = getattr(fila, "pct_internet", None)
+        if pd.notna(net) and net < UMBRAL_INTERNET_BAJO:
+            s.append("brecha_digital_alta")
+        # Contraste: contratación por menor por ENCIMA de la mediana de su
+        # departamento y resultados en el cuartil más bajo del mismo
+        # departamento. No prueba desvío de nada —SECOP ni siquiera dice dónde se
+        # ejecutó el gasto—; marca el municipio como candidato a revisión
+        # documental, que es exactamente para lo que existe la señal.
+        pct = getattr(fila, "percentil_depto", None)
+        cpm = getattr(fila, "contratacion_por_menor", None)
+        med = getattr(fila, "mediana_depto_contratacion", None)
+        if pd.notna(pct) and pd.notna(cpm) and pd.notna(med) and pct <= 25 and cpm > med:
+            s.append("revisar_contraste_recursos_resultados")
+        senales.append(s)
+    df["senales"] = senales
+    df["n_senales"] = [len(s) for s in senales]
+
+    df["corte"] = date.today().isoformat()
+    LOG.info("Fichas municipales: %s", f"{len(df):,}".replace(",", "."))
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# Ficha por sede
+# --------------------------------------------------------------------------- #
+
+SQL_SEDES = """
+CREATE OR REPLACE TABLE sede_base AS
+WITH ordenado AS (
+    SELECT *,
+           row_number() OVER (PARTITION BY cod_dane_sede ORDER BY periodo DESC) AS rn,
+           count(*)     OVER (PARTITION BY cod_dane_sede)                       AS periodos_con_dato
+    FROM saber11
+    WHERE cod_dane_sede IS NOT NULL AND evaluados > 0
+),
+ultimo AS (SELECT * FROM ordenado WHERE rn = 1),
+-- Pendiente simple entre el periodo más viejo y el más nuevo de la ventana de
+-- tendencia. Una regresión sobre tres puntos no es más honesta que una resta,
+-- y la resta se puede explicar en una frase a un rector.
+ventana AS (
+    SELECT cod_dane_sede,
+           arg_max(prom_matematicas, periodo) AS mat_fin,
+           arg_min(prom_matematicas, periodo) AS mat_ini,
+           max(periodo) AS p_fin, min(periodo) AS p_ini,
+           count(*) AS n
+    FROM ordenado WHERE rn <= {ventana}
+    GROUP BY cod_dane_sede
+)
+SELECT u.cod_dane_sede, u.nombre_sede, u.cod_municipio, u.municipio, u.departamento,
+       u.naturaleza, u.zona, u.periodo AS periodo_saber, u.periodos_con_dato,
+       u.evaluados, u.muestra_suficiente,
+       u.prom_lectura, u.prom_matematicas, u.prom_naturales, u.prom_sociales, u.prom_ingles,
+       u.pct_internet, u.pct_computador,
+       v.mat_ini, v.mat_fin, v.p_ini, v.p_fin, v.n AS periodos_tendencia
+FROM ultimo u LEFT JOIN ventana v USING (cod_dane_sede)
+"""
+
+
+def construir_sedes(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -> pd.DataFrame:
+    if not hay["saber11"]:
+        LOG.warning("Sin saber11_colegios.parquet no hay fichas por sede.")
+        return pd.DataFrame()
+
+    con.execute(SQL_SEDES.format(ventana=PERIODOS_TENDENCIA))
+    df = con.execute("SELECT * FROM sede_base").fetchdf()
+
+    # Comparación contra el municipio y contra el departamento. Un colegio se
+    # juzga frente a sus pares, no frente a una media nacional que mezcla
+    # contextos incomparables.
+    for ambito, clave in (("municipio", "cod_municipio"), ("depto", "departamento")):
+        g = df[df["muestra_suficiente"] == True].groupby(clave)["prom_matematicas"]  # noqa: E712
+        df[f"mediana_{ambito}_matematicas"] = df[clave].map(g.median()).round(1)
+
+    df["dif_vs_municipio"] = (df["prom_matematicas"] - df["mediana_municipio_matematicas"]).round(1)
+    df["dif_vs_depto"] = (df["prom_matematicas"] - df["mediana_depto_matematicas"]).round(1)
+    df["cambio_matematicas"] = (df["mat_fin"] - df["mat_ini"]).round(1)
+
+    senales: list[list[str]] = []
+    for fila in df.itertuples():
+        s: list[str] = []
+        if not getattr(fila, "muestra_suficiente", True):
+            s.append("muestra_insuficiente")
+        camb = getattr(fila, "cambio_matematicas", None)
+        per = getattr(fila, "periodos_tendencia", 0) or 0
+        if pd.notna(camb) and per >= PERIODOS_TENDENCIA and camb <= -UMBRAL_CAIDA_PUNTOS:
+            s.append("caida_sostenida")
+        dif = getattr(fila, "dif_vs_depto", None)
+        if pd.notna(dif) and dif <= -UMBRAL_CAIDA_PUNTOS:
+            s.append("por_debajo_de_su_departamento")
+        net = getattr(fila, "pct_internet", None)
+        if pd.notna(net) and net < UMBRAL_INTERNET_BAJO:
+            s.append("brecha_digital_alta")
+        senales.append(s)
+    df["senales"] = senales
+    df["n_senales"] = [len(s) for s in senales]
+
+    df["corte"] = date.today().isoformat()
+    LOG.info("Fichas por sede: %s", f"{len(df):,}".replace(",", "."))
+    return df
+
+
+
+# --------------------------------------------------------------------------- #
+# Gacetero: de un nombre a un lugar en el mapa
+# --------------------------------------------------------------------------- #
+
+def normalizar(serie: pd.Series) -> pd.Series:
+    """Sin tildes y en mayúsculas, para que «Monteria» encuentre «MONTERÍA»."""
+    return (
+        serie.astype("string")
+        .str.normalize("NFKD")
+        .str.encode("ascii", "ignore")
+        .str.decode("ascii")
+        .str.upper()
+        .str.strip()
+    )
+
+
+def construir_lugares(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -> pd.DataFrame:
+    """
+    Un índice de todo lugar con nombre propio del país: los 1.122 municipios más
+    los 8.161 centros poblados, cada uno con sus coordenadas.
+
+    Existe para responder «¿dónde queda Tibacuy?» a quien no conoce Colombia.
+    Y existe con una advertencia calculada encima: los nombres se repiten
+    muchísimo —«Pueblo Nuevo» aparece en 41 municipios de 19 departamentos—, así
+    que cada fila lleva cuántos homónimos tiene. Con más de uno, el agente está
+    obligado a preguntar en vez de escoger el primero: mandar a alguien a
+    diagnosticar el municipio equivocado es peor que no responder.
+    """
+    if not hay["geo_mun"]:
+        LOG.warning("Sin territorio_municipios.parquet no se puede armar el gacetero.")
+        return pd.DataFrame()
+
+    municipios = con.execute("""
+        SELECT cod_municipio AS cod_lugar, municipio AS lugar, 'municipio' AS tipo,
+               cod_municipio, municipio, cod_departamento, departamento, lat, lon
+        FROM geo_mun
+    """).fetchdf()
+
+    partes = [municipios]
+    if hay["geo_cp"]:
+        centros = con.execute("""
+            SELECT cod_lugar, lugar, tipo, cod_municipio, municipio,
+                   cod_departamento, departamento, lat, lon
+            FROM geo_cp
+            -- La cabecera municipal duplica al municipio: el mismo punto con el
+            -- mismo nombre aparecería dos veces en cualquier búsqueda.
+            WHERE tipo <> 'cabecera municipal'
+        """).fetchdf()
+        partes.append(centros)
+
+    df = pd.concat(partes, ignore_index=True)
+    df["busqueda"] = normalizar(df["lugar"])
+
+    # Homónimos: cuántos lugares comparten exactamente este nombre en el país.
+    df["homonimos"] = df.groupby("busqueda")["busqueda"].transform("count")
+
+    sin_coordenada = int(df["lat"].isna().sum())
+    if sin_coordenada:
+        LOG.warning("%s lugares sin coordenada: no se podrán ubicar en el mapa", sin_coordenada)
+
+    ambiguos = int((df["homonimos"] > 1).sum())
+    LOG.info("Gacetero: %s lugares (%s con nombre repetido en el país)",
+             f"{len(df):,}".replace(",", "."), f"{ambiguos:,}".replace(",", "."))
+    return df
+
+
+# --------------------------------------------------------------------------- #
+
+def escribir_metadatos(salida: Path, hay: dict[str, bool], n_mun: int, n_sede: int,
+                       n_lugar: int = 0) -> None:
+    """
+    Los umbrales quedan escritos junto a los datos. Quien lea una ficha dentro de
+    un año tiene que poder saber con qué regla se marcó una señal, sin abrir el
+    código.
+    """
+    meta = {
+        "generado": date.today().isoformat(),
+        "fichas_municipio": n_mun,
+        "fichas_sede": n_sede,
+        "lugares_en_el_gacetero": n_lugar,
+        "fuentes_presentes": {k: v for k, v in hay.items()},
+        "umbrales": {
+            "muestra_minima": MUESTRA_MINIMA,
+            "periodos_tendencia": PERIODOS_TENDENCIA,
+            "cobertura_neta_baja_pct": UMBRAL_COBERTURA_BAJA,
+            "desercion_alta_pct": UMBRAL_DESERCION_ALTA,
+            "internet_bajo_pct": UMBRAL_INTERNET_BAJO,
+            "caida_sostenida_puntos": UMBRAL_CAIDA_PUNTOS,
+        },
+        "advertencias": [
+            "Los umbrales son convenciones de trabajo de Fundación Startin, no normas oficiales.",
+            "Las señales indican dónde revisar; no constituyen hallazgo ni acusación.",
+            "SECOP registra el municipio de la entidad contratante, no el lugar de ejecución del gasto.",
+            "Las comparaciones son dentro del departamento, nunca contra el promedio nacional.",
+            "El PIB solo existe por departamento: es contexto regional, no cifra del municipio.",
+            "Las distancias son en línea recta, no por carretera.",
+            "No hay capa nacional de veredas ni polígonos municipales: el mapa es de puntos.",
+        ],
+    }
+    (salida / "fichas_metadatos.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Construye las fichas precalculadas de Brújula")
+    parser.add_argument("--datos", type=Path, default=Path("./data"))
+    parser.add_argument("--salida", type=Path, default=Path("./data"))
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)-8s %(message)s",
+    )
+    args.salida.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect()
+    LOG.info("Fuentes en %s:", args.datos)
+    hay = registrar(con, args.datos)
+
+    municipios = construir_municipios(con, hay)
+    municipios.to_parquet(args.salida / "fichas_municipio.parquet", index=False)
+
+    sedes = construir_sedes(con, hay)
+    if not sedes.empty:
+        sedes.to_parquet(args.salida / "fichas_sede.parquet", index=False)
+
+    lugares = construir_lugares(con, hay)
+    if not lugares.empty:
+        lugares.to_parquet(args.salida / "fichas_lugar.parquet", index=False)
+
+    escribir_metadatos(args.salida, hay, len(municipios), len(sedes), len(lugares))
+
+    print("\n" + "=" * 62)
+    print(f"Fichas municipales : {len(municipios):,}".replace(",", "."))
+    print(f"Fichas por sede    : {len(sedes):,}".replace(",", "."))
+    if "n_senales" in municipios:
+        con_señal = int((municipios["n_senales"] > 0).sum())
+        print(f"Municipios con señal: {con_señal:,}".replace(",", "."))
+    if not sedes.empty:
+        print(f"Sedes con señal    : {int((sedes['n_senales'] > 0).sum()):,}".replace(",", "."))
+    if not lugares.empty:
+        print(f"Lugares ubicables  : {len(lugares):,}".replace(",", "."))
+        print(f"  con nombre repetido: {int((lugares['homonimos'] > 1).sum()):,}".replace(",", "."))
+    print("=" * 62)
+    print("Las señales marcan dónde revisar. No son hallazgos.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
