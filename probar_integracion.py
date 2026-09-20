@@ -72,6 +72,15 @@ def listar_municipios(departamento: str) -> str:
 
 
 @mcp.tool()
+def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = "resultado") -> str:
+    """Las sedes de un municipio."""
+    return json.dumps({"encontrado": True, "sedes": [
+        {"cod_dane_sede": "2", "nombre": "IE Zeta", "naturaleza": "OFICIAL", "zona": "RURAL", "evaluados": 30},
+        {"cod_dane_sede": "1", "nombre": "IE Alfa", "naturaleza": "NO OFICIAL", "zona": "URBANO", "evaluados": 90},
+    ]}, ensure_ascii=False)
+
+
+@mcp.tool()
 def ficha_municipio(departamento: str, municipio: str) -> str:
     """Ficha de un municipio."""
     return json.dumps({
@@ -109,8 +118,10 @@ class ModeloSimulado:
 
     def __init__(self):
         self.chat = types.SimpleNamespace(completions=self)
+        self.visto: list[list[dict]] = []
 
     def create(self, **kw):
+        self.visto.append(kw.get("messages", []))
         ya_llamo = any(m.get("role") == "tool" for m in kw.get("messages", []))
         if not ya_llamo:
             llamada = types.SimpleNamespace(
@@ -164,7 +175,8 @@ def _comprobar() -> int:
     sys.path.insert(0, RAIZ)
 
     import orquestador
-    orquestador.cliente_modelo = lambda: ModeloSimulado()
+    modelo = ModeloSimulado()
+    orquestador.cliente_modelo = lambda: modelo
     orquestador.enviar_correo = lambda *a, **k: None
 
     from fastapi.testclient import TestClient
@@ -179,7 +191,7 @@ def _comprobar() -> int:
     with TestClient(orquestador.crear_app()) as cliente:
         print("\n== 1. El orquestador ve el catálogo del MCP ==")
         salud = cliente.get("/salud").json()
-        ok(salud["herramientas"] == 3, "el catálogo llegó completo")
+        ok(salud["herramientas"] == 4, "el catálogo llegó completo")
         ok(salud["consultas"] == "abiertas", "las consultas quedan abiertas")
 
         print("\n== 2. Una pregunta cruza entera ==")
@@ -214,6 +226,25 @@ def _comprobar() -> int:
            "llegan todos los departamentos del corte")
         ok(mapa.get("NARIÑO") == ["Túquerres"],
            "cada departamento trae sus municipios")
+
+        print("\n== 4b. Las sedes del municipio y el ámbito por sede ==")
+        c = cliente.get("/colegios", params={"departamento": "CUNDINAMARCA", "municipio": "Soacha"})
+        sedes = c.json().get("sedes", [])
+        ok(c.status_code == 200 and [s["nombre"] for s in sedes] == ["IE Alfa", "IE Zeta"],
+           "lista las sedes ordenadas por nombre, con código")
+        ok(all({"cod", "nombre", "naturaleza", "zona"} <= set(s) for s in sedes), "con los campos que el selector necesita")
+        r4 = cliente.post("/preguntar", json={"pregunta": "¿cómo le va?", "departamento": "CUNDINAMARCA",
+            "municipio": "Soacha", "sede": "IE Alfa", "cod_sede": "1", "visitante": "visitante-3"})
+        ok(r4.status_code == 200, "una pregunta con sede responde 200")
+        sistema = " ".join(m.get("content", "") for m in modelo.visto[-1] if m.get("role") == "system")
+        ok("Sede elegida: IE Alfa" in sistema and "código DANE 1" in sistema,
+           "y el modelo recibe la sede y su código en el ámbito")
+        r5 = cliente.post("/preguntar", json={"pregunta": "¿cómo le va?", "departamento": "CUNDINAMARCA",
+            "municipio": "Soacha", "sede": "IE Zeta", "cod_sede": "2", "visitante": "visitante-3"})
+        ok(r5.json().get("desde_cache") is False, "la misma pregunta sobre otra sede no sale de la caché de la primera")
+        r6 = cliente.post("/preguntar", json={"pregunta": "¿cómo le va?", "departamento": "CUNDINAMARCA",
+            "municipio": "Soacha", "sede": "IE Alfa", "cod_sede": "1", "visitante": "visitante-3"})
+        ok(r6.json().get("desde_cache") is True, "y repetirla sobre la misma sede sí")
 
         print("\n== 5. El registro sigue vivo aunque no haya modelo ==")
         r3 = cliente.post("/registrar", json={

@@ -229,16 +229,20 @@ def main() -> int:
     check("y deja pasar la consulta real", v3.permitir)
 
     print("\n== 4. El límite por IP frena un script ==")
+    # Se prueba con visitantes registrados para aislar el límite por hora: a
+    # un anónimo que cambia de navegador lo frena antes el cupo libre diario
+    # por IP (prueba 16), que es justo lo que se quiere.
     p = P.Portero(presupuesto_diario_usd=100.0)
     bloqueado_en = None
     for i in range(P.LIMITE_IP_POR_HORA + 5):
-        v = p.evaluar(f"pregunta numero {i}", "7.7.7.7", f"visitante{i}", "TOLIMA", "Ibagué")
+        v = p.evaluar(f"pregunta numero {i}", "7.7.7.7", f"visitante{i}", "TOLIMA", "Ibagué",
+                      registrado=True)
         if not v.permitir and v.codigo == 429:
             bloqueado_en = i
             break
         if v.permitir and not v.desde_cache:
             p.registrar_consumo(f"pregunta numero {i}", "7.7.7.7", f"visitante{i}",
-                                {"r": i}, 100, 50, "TOLIMA", "Ibagué")
+                                {"r": i}, 100, 50, "TOLIMA", "Ibagué", registrado=True)
     check("bloquea al llegar al límite", bloqueado_en == P.LIMITE_IP_POR_HORA, bloqueado_en)
     check("sugiere cuánto esperar", v.espera_segundos is not None)
     otra = p.evaluar("pregunta nueva", "8.8.8.8", "otro", "TOLIMA", "Ibagué")
@@ -300,6 +304,36 @@ def main() -> int:
 
 
     probar_almacen_compartido()
+
+    print("\n== 15. La sede entra en la clave de la caché ==")
+    a = P.clave_cache("¿cómo le va?", "NARIÑO", "Tumaco")
+    b = P.clave_cache("¿cómo le va?", "NARIÑO", "Tumaco", sede="IE Alfa")
+    c = P.clave_cache("¿cómo le va?", "NARIÑO", "Tumaco", sede="IE Zeta")
+    check("municipio entero y una sede son claves distintas", a != b)
+    check("dos sedes son claves distintas", b != c)
+    check("la misma sede da la misma clave", b == P.clave_cache("¿cómo le va?", "NARIÑO", "Tumaco", sede="ie alfa"))
+
+    print("\n== 16. El cupo libre también se cuenta por conexión ==")
+    # El cupo de diez vive en el navegador; abrir una ventana de incógnito
+    # estrena otro. Este tope suma todo lo que sale por la misma IP en el día.
+    p = P.Portero(presupuesto_diario_usd=100.0)
+    tope = P.PREGUNTAS_LIBRES_IP_DIA
+    ip = "9.9.9.9"
+    permitidas = 0
+    for i in range(tope + 3):
+        v = p.evaluar(f"pregunta {i}", ip, f"navegador-{i}", "META", "Villavicencio")   # cada vez otro «navegador»
+        if v.permitir:
+            permitidas += 1
+            p.registrar_consumo(f"pregunta {i}", ip, f"navegador-{i}", {"r": i}, 1000, 100,
+                                "META", "Villavicencio")
+    check(f"desde una IP, cambiando de navegador, pasan exactamente {tope}", permitidas == tope, permitidas)
+    check("la siguiente recibe 402 con invitación a registrarse", v.codigo == 402 and "Regístrate" in v.motivo, (v.codigo, v.motivo))
+    v_otra = p.evaluar("otra", "8.8.8.8", "navegador-x", "META", "Villavicencio")
+    check("otra IP no se ve afectada", v_otra.permitir)
+    v_reg = p.evaluar("otra", ip, "navegador-reg", "META", "Villavicencio", registrado=True)
+    check("una persona registrada en esa misma IP sí pasa", v_reg.permitir, v_reg.motivo)
+    p.registrar_consumo("otra", ip, "navegador-reg", {"r": 1}, 1000, 100, "META", "Villavicencio", registrado=True)
+    check("y su consulta no gasta el cupo libre de la conexión", p.almacen.libres_ip_hoy(ip) == tope, p.almacen.libres_ip_hoy(ip))
 
     print("\n" + "=" * 64)
     if FALLOS:

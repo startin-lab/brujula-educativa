@@ -327,7 +327,8 @@ def cliente_modelo():
 
 async def responder(pregunta: str, departamento: str, municipio: str,
                     herramientas: Herramientas, modelo: Any,
-                    acceso_completo: bool = False) -> dict[str, Any]:
+                    acceso_completo: bool = False,
+                    sede: str = "", cod_sede: str = "") -> dict[str, Any]:
     """
     Una pregunta, de principio a fin.
 
@@ -340,6 +341,13 @@ async def responder(pregunta: str, departamento: str, municipio: str,
         ambito.append(f"Departamento: {departamento}")
     if municipio:
         ambito.append(f"Municipio: {municipio}")
+    if sede:
+        # Con sede elegida, la pregunta es sobre ESA sede. Se le da al modelo
+        # el código DANE para que use ficha_colegio sin adivinar entre
+        # homónimas, y se le dice que el municipio queda como referencia.
+        ambito.append(f"Sede elegida: {sede}" + (f" (código DANE {cod_sede})" if cod_sede else "")
+                      + ". Responde sobre esta sede con ficha_colegio; el municipio y el "
+                        "departamento son su referencia de comparación.")
     contexto = " · ".join(ambito) if ambito else "Sin territorio elegido todavía."
 
     mensajes = [
@@ -541,6 +549,9 @@ def crear_app():
         pregunta: str = Field(min_length=3, max_length=500)
         departamento: str = ""
         municipio: str = ""
+        # Opcional: una sede concreta. Vacío significa «todo el municipio».
+        sede: str = Field(default="", max_length=160)
+        cod_sede: str = Field(default="", max_length=20, pattern=r"^[0-9]*$")
         visitante: str = ""
 
     class Registro(BaseModel):
@@ -664,7 +675,7 @@ def crear_app():
         veredicto = portero.evaluar(
             consulta.pregunta, ip, visitante,
             consulta.departamento, consulta.municipio,
-            registrado=registrado,
+            registrado=registrado, sede=consulta.sede,
         )
         if veredicto.desde_cache and veredicto.respuesta:
             # Sale de caché: no se llama al modelo y no se descuenta nada.
@@ -679,6 +690,7 @@ def crear_app():
             resultado = await responder(
                 consulta.pregunta, consulta.departamento, consulta.municipio,
                 estado["herramientas"], estado["modelo"],
+                sede=consulta.sede, cod_sede=consulta.cod_sede,
             )
         except Exception as exc:  # noqa: BLE001
             LOG.exception("La consulta falló")
@@ -692,6 +704,7 @@ def crear_app():
             consulta.pregunta, ip, visitante, resultado,
             resultado["tokens_entrada"], resultado["tokens_salida"],
             consulta.departamento, consulta.municipio,
+            sede=consulta.sede, registrado=registrado,
         )
         LOG.info("Consulta atendida: %s vueltas, %.4f USD", resultado["vueltas"], usd)
         return JSONResponse({**resultado, "desde_cache": False,
@@ -764,6 +777,48 @@ def crear_app():
             fichas[clave] = {"datos": datos, "cuando": time.time()}
         return JSONResponse(datos, status_code=200 if datos.get("encontrado") else 404,
                             headers={"cache-control": "public, max-age=1800"})
+
+    @app.get("/colegios")
+    async def colegios(departamento: str = "", municipio: str = ""):
+        """
+        Las sedes de un municipio, para el tercer desplegable. Sin modelo.
+
+        Solo aparecen las que tienen resultados en Saber 11 —es la única fuente
+        abierta con datos por sede—, así que una escuela de primaria no va a
+        estar. La página lo dice al lado del selector; aquí solo se listan.
+        """
+        dep, mun = departamento.strip(), municipio.strip()
+        if not dep or not mun:
+            return JSONResponse({"motivo": "Faltan departamento y municipio."}, status_code=400)
+        clave = f"{dep.casefold()}|{mun.casefold()}"
+        listas = estado.setdefault("colegios", {})
+        guardada = listas.get(clave)
+        if guardada and time.time() - guardada["cuando"] < 6 * 3600:
+            return JSONResponse(guardada["datos"], headers={"cache-control": "public, max-age=1800"})
+
+        if not estado["herramientas"].catalogo:
+            await estado["herramientas"].reintentar()
+        try:
+            datos = await estado["herramientas"].una(
+                "colegios_del_municipio",
+                {"departamento": dep, "municipio": mun, "orden": "nombre"})
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo listar las sedes de %s, %s", mun, dep)
+            return JSONResponse({"motivo": "El servidor de datos no respondió."}, status_code=503)
+
+        sedes = sorted(
+            [{"cod": str(x.get("cod_dane_sede") or ""), "nombre": x.get("nombre") or "",
+              "naturaleza": x.get("naturaleza") or "", "zona": x.get("zona") or "",
+              "evaluados": x.get("evaluados")}
+             for x in datos.get("sedes", []) if x.get("nombre")],
+            key=lambda x: x["nombre"].casefold())
+        salida = {"encontrado": bool(datos.get("encontrado")), "sedes": sedes,
+                  "fuente": "ICFES — Saber 11: solo colegios con estudiantes evaluados en grado 11."}
+        if sedes:
+            if len(listas) > 1500:
+                listas.clear()
+            listas[clave] = {"datos": salida, "cuando": time.time()}
+        return JSONResponse(salida, headers={"cache-control": "public, max-age=1800"})
 
     @app.get("/estado")
     async def estado_de_visitante(v: str = "", peticion: Request = None):

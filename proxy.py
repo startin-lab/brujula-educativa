@@ -97,6 +97,13 @@ LIMITE_IP_POR_HORA = int(_num("BRUJULA_LIMITE_IP_HORA", 30))
 # Los datos se refrescan una vez al mes: una respuesta de hace una semana sigue
 # siendo la respuesta correcta. Siete días es conservador a propósito.
 CACHE_DIAS = int(_num("BRUJULA_CACHE_DIAS", 7))
+# Consultas libres por dirección IP y día, sumando todos los navegadores que
+# salgan por ella. El cupo de diez vive en el navegador y se reinicia abriendo
+# una ventana de incógnito; este tope hace que el truco no rinda. Es alto a
+# propósito: una secretaría entera suele salir por una sola IP y no puede
+# quedarse sin servicio porque tres personas preguntaron a la vez. Quien lo
+# alcance ve el mismo formulario de registro que los demás.
+PREGUNTAS_LIBRES_IP_DIA = int(_num("BRUJULA_PREGUNTAS_LIBRES_IP_DIA", 25))
 # Una etiqueta que entra en la clave de la caché y permite invalidarla entera
 # cambiando una variable de entorno.
 #
@@ -146,7 +153,11 @@ def normalizar_pregunta(texto: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def clave_cache(pregunta: str, departamento: str, municipio: str) -> str:
+def _hoy_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+def clave_cache(pregunta: str, departamento: str, municipio: str, sede: str = "") -> str:
     """
     El territorio ENTRA en la clave. Sin él, «¿cómo va la cobertura?» en Soacha
     devolvería la respuesta guardada para Leticia, que es el peor error posible
@@ -161,6 +172,7 @@ def clave_cache(pregunta: str, departamento: str, municipio: str) -> str:
         normalizar_pregunta(pregunta),
         normalizar_pregunta(departamento),
         normalizar_pregunta(municipio),
+        normalizar_pregunta(sede),     # la misma pregunta sobre otra sede es otra pregunta
     ])
     return hashlib.sha256(crudo.encode("utf-8")).hexdigest()[:32]
 
@@ -214,6 +226,13 @@ class AlmacenMemoria:
 
     def preguntas_usadas(self, visitante: str) -> int:
         return self.usadas.get(visitante, 0)
+
+    def libres_ip_hoy(self, ip: str) -> int:
+        return self.usadas.get(f"ip-dia|{ip}|{_hoy_utc()}", 0)
+
+    def sumar_libre_ip(self, ip: str) -> None:
+        k = f"ip-dia|{ip}|{_hoy_utc()}"
+        self.usadas[k] = self.usadas.get(k, 0) + 1
 
     def sumar_pregunta(self, visitante: str) -> None:
         self.usadas[visitante] = self.usadas.get(visitante, 0) + 1
@@ -488,6 +507,13 @@ class AlmacenTablas:
         fila = self._leer("visitante", visitante)
         return int(fila.get("n", 0)) if fila else 0
 
+    def libres_ip_hoy(self, ip: str) -> int:
+        fila = self._leer("ip_dia", self._clave_dia(ip))
+        return int(fila.get("n", 0)) if fila else 0
+
+    def sumar_libre_ip(self, ip: str) -> None:
+        self._sumar_atomico("ip_dia", self._clave_dia(ip), "n", 1)
+
     def sumar_pregunta(self, visitante: str) -> None:
         self._sumar_atomico("visitante", visitante, "n", 1)
 
@@ -552,6 +578,11 @@ class AlmacenTablas:
         })
 
     @staticmethod
+    def _clave_dia(ip: str) -> str:
+        limpia = re.sub(r"[^A-Za-z0-9._-]", "_", ip)
+        return f"{limpia}-{_hoy_utc()}"
+
+    @staticmethod
     def _clave_hora(ip: str) -> str:
         # La IP va sanitizada: ':' y '/' no son válidos en una RowKey.
         limpia = re.sub(r"[^A-Za-z0-9._-]", "_", ip)
@@ -585,8 +616,8 @@ class Portero:
     def evaluar(self, pregunta: str, ip: str, visitante: str,
                 departamento: str = "", municipio: str = "",
                 acceso_completo: bool = False,
-                registrado: bool = False) -> Veredicto:
-        clave = clave_cache(pregunta, departamento, municipio)
+                registrado: bool = False, sede: str = "") -> Veredicto:
+        clave = clave_cache(pregunta, departamento, municipio, sede)
 
         # --- 1. Límite por IP ------------------------------------------- #
         # Va primero porque es lo único que frena un script, y un script puede
@@ -649,7 +680,18 @@ class Portero:
                     False,
                     f"Usaste tus {PREGUNTAS_LIBRES} consultas libres. Cuéntanos "
                     "de qué organización eres y para qué usarás los datos y "
-                    "seguimos: el registro está en la página de inicio.",
+                    "seguimos: el registro está aquí mismo, más abajo.",
+                    402,
+                )
+            # El mismo cupo, visto desde la conexión: cubre a quien abre otro
+            # navegador para volver a empezar. El mensaje es el mismo porque la
+            # salida también lo es —registrarse—, y no hace falta explicarle a
+            # nadie qué truco creemos que intentó.
+            if self.almacen.libres_ip_hoy(ip) >= PREGUNTAS_LIBRES_IP_DIA:
+                return Veredicto(
+                    False,
+                    "Esta conexión ya usó las consultas libres del día. "
+                    "Regístrate —aquí mismo, más abajo— y seguimos sin tope.",
                     402,
                 )
 
@@ -657,7 +699,8 @@ class Portero:
 
     def registrar_consumo(self, pregunta: str, ip: str, visitante: str,
                           respuesta: dict, tokens_entrada: int, tokens_salida: int,
-                          departamento: str = "", municipio: str = "") -> float:
+                          departamento: str = "", municipio: str = "",
+                          sede: str = "", registrado: bool = False) -> float:
         """
         Después de la llamada: se anota lo que costó de verdad y se guarda la
         respuesta. Reconciliar con el consumo real —en vez de quedarse con la
@@ -667,7 +710,9 @@ class Portero:
         self.almacen.sumar_gasto(self._hoy(), usd)
         self.almacen.registrar_peticion(ip)
         self.almacen.sumar_pregunta(visitante)
-        self.almacen.guardar_cache(clave_cache(pregunta, departamento, municipio), respuesta)
+        if not registrado:
+            self.almacen.sumar_libre_ip(ip)
+        self.almacen.guardar_cache(clave_cache(pregunta, departamento, municipio, sede), respuesta)
         return usd
 
     def estado(self) -> dict:
@@ -681,6 +726,7 @@ class Portero:
             "porcentaje_usado": round(gastado / self.presupuesto_diario * 100, 1)
                                 if self.presupuesto_diario else None,
             "preguntas_libres": PREGUNTAS_LIBRES,
+            "preguntas_libres_ip_dia": PREGUNTAS_LIBRES_IP_DIA,
             "limite_ip_por_hora": LIMITE_IP_POR_HORA,
             "cache_dias": CACHE_DIAS,
         }

@@ -52,6 +52,10 @@ FICHA = {
         "advertencia": "El PIB solo se publica por departamento."},
     "senales": [{"clave": "cobertura_neta_baja"}, {"clave": "brecha_digital_alta"}],
 }
+COLEGIOS = {"encontrado": True, "sedes": [
+    {"cod": "152835000011", "nombre": "IE Ciudadela Tumac", "naturaleza": "OFICIAL", "zona": "URBANO", "evaluados": 120},
+    {"cod": "152835000022", "nombre": "IE Robert Mario Bischoff", "naturaleza": "OFICIAL", "zona": "URBANO", "evaluados": 88},
+]}
 RESPUESTA = {
     "respuesta": "En **Tumaco** la cobertura es baja:\n\n- **Neta:** **66,1 %**\n- **Bruta:** 81,2 %\n\n"
                  "**Señales**\n1. Cobertura neta baja.\n2. Brecha digital alta.",
@@ -107,13 +111,18 @@ def main() -> int:
 
         # El servicio simulado responde a lo que la página pida.
         API = "https://acceso.brujula.startinlab.org"
+        enviados: list[dict] = []
         def ruta(route, request):
             url = request.url
+            if url.startswith(f"{API}/preguntar"):
+                try: enviados.append(json.loads(request.post_data or "{}"))
+                except Exception: pass
             cuerpo = None
             if url.startswith(f"{API}/territorios"): cuerpo = TERRITORIOS
             elif url.startswith(f"{API}/estado"):    cuerpo = {"registrado": False, "restantes": 10}
             elif url.startswith(f"{API}/preguntar"): cuerpo = RESPUESTA
             elif url.startswith(f"{API}/ficha"):     cuerpo = FICHA
+            elif url.startswith(f"{API}/colegios"):  cuerpo = COLEGIOS
             if cuerpo is None:
                 return route.fulfill(status=404, body="")
             route.fulfill(status=200, content_type="application/json",
@@ -145,7 +154,8 @@ def main() -> int:
         inicio = pagina.inner_text("#inicio")
         ok("60.491" in inicio, "muestra la población de 5 a 16 años")
         ok("178" in inicio and "Pasto" in inicio, "la distancia a la capital")
-        ok("Popayán" in inicio and "Cali" in inicio, "las capitales cercanas")
+        ok("Popayán" not in inicio and "Cali" not in inicio, "sin lista de capitales cercanas: solo la propia y Bogotá")
+        ok("620" in inicio and "Bogotá" in inicio, "la distancia a Bogotá")
         ok("Agropecuario y pesca" in inicio and "Gobierno, educación y salud" in inicio,
            "de qué vive el departamento, con las ramas del DANE en nombre corto")
         ok("afiliación obligatoria" not in inicio, "sin la denominación completa de la CIIU en pantalla")
@@ -164,10 +174,26 @@ def main() -> int:
         ok(pagina.eval_on_selector_all("#inicio svg .recuadro rect.marco", "e => e.length") == 1,
            "con el recuadro del país indicando la zona")
         ok(pagina.eval_on_selector_all("#inicio svg circle.mun", "e => e.length") == 1, "con el municipio marcado")
-        ok(pagina.eval_on_selector_all("#inicio svg circle.cap", "e => e.length") == 3, "y las tres capitales cercanas")
+        ok(pagina.eval_on_selector_all("#inicio svg circle.cap", "e => e.length") == 1, "y la capital del departamento")
         ok("DANE" in inicio, "acredita la fuente de las siluetas")
         ok(pagina.inner_text("#chip-cupo").strip().lower() == "10 consultas libres", "la ficha no descontó cupo")
         ok(not errores, "sin errores de JavaScript al pintar la ficha" + (f" → {errores[0][:90]}" if errores else ""))
+
+        print("\n== 4b. El tercer selector: un colegio, o todos ==")
+        pagina.wait_for_selector("#campo-sede:not([hidden])", timeout=5000)
+        ok(pagina.eval_on_selector("#sel-sede", "e => e.options.length") == 3,
+           "lista los colegios con Saber 11 más la opción «todos»")
+        ok("primaria" in pagina.inner_text("#nota-sede").lower(), "avisa que los de solo primaria no aparecen")
+        chips_mun = pagina.inner_text("#preguntas")
+        ok("qué dato lo sustenta" in chips_mun and "NO se puede concluir" in chips_mun,
+           "las preguntas del municipio piden diagnóstico, no descripción")
+        pagina.select_option("#sel-sede", "IE Ciudadela Tumac")
+        ok("ciudadela" in pagina.inner_text("#chip-alcance").lower(), "el chip del ámbito muestra la sede")
+        chips_sede = pagina.inner_text("#preguntas")
+        ok("esta sede" in chips_sede and "qué dato lo sustenta" not in chips_sede,
+           "con sede elegida las preguntas cambian a la sede")
+        pagina.select_option("#sel-sede", "")
+        ok("qué dato lo sustenta" in pagina.inner_text("#preguntas"), "y vuelven al elegir «todos»")
 
         print("\n== 5. Una pregunta se pinta bien ==")
         pagina.fill("#pregunta", "¿Cómo está la cobertura?")
@@ -186,6 +212,15 @@ def main() -> int:
         ok("31" not in pagina.inner_text(".vis") or "sin rotular" in pagina.inner_text("#bloques"),
            "y dice cuántos quedan sin rótulo")
         ok("Cobertura neta baja" in pagina.inner_text("#bloques"), "la señal se muestra legible, no como identificador")
+        ok(enviados and enviados[-1].get("sede") == "" and enviados[-1].get("cod_sede") == "",
+           "sin colegio elegido, la consulta va sobre todo el municipio")
+        pagina.select_option("#sel-sede", "IE Robert Mario Bischoff")
+        pagina.fill("#pregunta", "¿cómo le va a esta sede?")
+        pagina.click("#enviar")
+        pagina.wait_for_timeout(600)
+        ok(enviados[-1].get("sede") == "IE Robert Mario Bischoff" and enviados[-1].get("cod_sede") == "152835000022",
+           "con colegio elegido, la consulta lleva la sede y su código DANE")
+        pagina.select_option("#sel-sede", "")
         ok(not errores, "sin errores de JavaScript durante la consulta" + (f" → {errores[0][:90]}" if errores else ""))
 
         print("\n== 6. Al agotar el cupo, el registro aparece en la misma página ==")
