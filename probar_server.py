@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import date
 import sys
 import tempfile
 from pathlib import Path
@@ -228,6 +229,62 @@ def generar(destino: Path) -> None:
     detalle["cod_municipio"] = detalle["cod_municipio"].astype("string")
     detalle.to_parquet(destino / "secop_contratos_mayores.parquet", index=False)
 
+    # --- Población DANE, matrícula y docentes MEN --------------------------- #
+    # El esquema imita al de ingest_poblacion.py e ingest_matricula.py.
+    # Muni3 es Entidad Territorial Certificada propia (como Soacha o Tumaco);
+    # los demás dependen de la ETC de su departamento. Muni7 no tiene población:
+    # un municipio nuevo que el DANE aún no proyecta tiene que seguir teniendo
+    # ficha, sin la cifra, y sin romper nada.
+    hoy = date.today().year
+    pob = []
+    for cod, nom, dep, cd in municipios:
+        if nom == "Muni7":
+            continue
+        base = int(rng.integers(8_000, 900_000))
+        for anio in range(2018, 2043):
+            total = base + (anio - 2018) * 100
+            pob.append(dict(cod_municipio=cod, anio=anio, cod_departamento=cd,
+                            departamento_dane=dep.title(), municipio_dane=nom,
+                            poblacion_total=total, poblacion_cabecera=int(total * .7),
+                            poblacion_rural=total - int(total * .7),
+                            poblacion_5_16_dane=int(total * .18), poblacion_5_18_dane=int(total * .21),
+                            fuente="DANE — Proyecciones de población 2018-2042 (CNPV 2018)",
+                            actualizacion_dane="2025-07-30"))
+    pd.DataFrame(pob).to_parquet(destino / "poblacion_municipios.parquet", index=False)
+
+    mat = pd.DataFrame([
+        dict(cod_municipio=cod, matricula_total=int(rng.integers(1_000, 150_000)),
+             anio_matricula=hoy - 1) for cod, nom, dep, cd in municipios
+    ])
+    mat["matricula_oficial"] = (mat["matricula_total"] * 0.8).astype("int64")
+    mat["matricula_no_oficial"] = mat["matricula_total"] - mat["matricula_oficial"]
+    mat["matricula_rural"] = (mat["matricula_total"] * 0.3).astype("int64")
+    mat["cod_municipio"] = mat["cod_municipio"].astype("string")
+    mat.to_parquet(destino / "matricula_municipios.parquet", index=False)
+
+    ms = pd.DataFrame([
+        dict(cod_dane_sede=f"{cod}0000{j}", cod_municipio=cod,
+             matricula=int(rng.integers(60, 2500)), anio_matricula=hoy - 1)
+        for cod, nom, dep, cd in municipios for j in range(6) if j != 2   # la sede 2 sin matrícula
+    ])
+    for col in ("cod_dane_sede", "cod_municipio"):
+        ms[col] = ms[col].astype("string")
+    ms.to_parquet(destino / "matricula_sedes.parquet", index=False)
+
+    # La columna `etc` del MEN: «Antioquia (ETC)» para casi todos, «Muni3 (ETC)»
+    # para el certificado. Se escribe en el parquet del MEN ya generado.
+    men = pd.read_parquet(destino / "men_municipios.parquet")
+    men["etc"] = [f"{m} (ETC)" if m == "Muni3" else f"{d.title()} (ETC)"
+                  for m, d in zip(men["municipio"], men["departamento"])]
+    men.to_parquet(destino / "men_municipios.parquet", index=False)
+
+    doc = pd.DataFrame([
+        dict(etc_norm="ANTIOQUIA", etc="Antioquia", docentes_oficiales=19451, docentes_rurales=6000, anio_docentes=2022),
+        dict(etc_norm="CUNDINAMARCA", etc="Cundinamarca", docentes_oficiales=11031, docentes_rurales=5000, anio_docentes=2022),
+        dict(etc_norm="MUNI3", etc="Muni3", docentes_oficiales=840, docentes_rurales=120, anio_docentes=2022),
+    ])
+    doc.to_parquet(destino / "docentes_etc.parquet", index=False)
+
 
 # --------------------------------------------------------------------------- #
 # Andamiaje
@@ -334,6 +391,38 @@ def main() -> int:
         check("municipio inexistente no inventa",
               llamar(S.ficha_municipio, municipio="Macondo", departamento="ANTIOQUIA")["encontrado"] is False)
 
+        print("\n== 3a. Habitantes, matrícula y docentes en la ficha ==")
+        pobl = f.get("poblacion") or {}
+        check("la ficha trae habitantes del año en curso",
+              pobl.get("habitantes") and pobl.get("anio") == date.today().year, pobl)
+        check("y la franja de 5 a 18 con su porcentaje",
+              pobl.get("de_5_a_18") and pobl.get("pct_de_5_a_18") == 21.0, pobl.get("pct_de_5_a_18"))
+        check("la matrícula llega con año y sector",
+              (f.get("matricula") or {}).get("estudiantes") and f["matricula"]["oficial"] < f["matricula"]["estudiantes"])
+        doc4 = f.get("docentes") or {}
+        check("Muni4 recibe los docentes de la ETC Antioquia, y lo dice",
+              doc4.get("docentes_oficiales") == 19451 and doc4.get("la_etc_es_este_municipio") is False
+              and doc4.get("municipios_que_comparten_la_etc") == 19, doc4)   # 20 menos Muni3, que es ETC propia
+        check("sin ETC propia no se calcula estudiantes por docente",
+              doc4.get("estudiantes_oficiales_por_docente") is None)
+        etiquetas = [c["etiqueta"] for c in f["vis"][0]["cifras"]]
+        check("las cifras empiezan por habitantes, 5-18, estudiantes, docentes",
+              etiquetas[0].startswith("Habitantes") and etiquetas[1].startswith("Población de 5 a 18")
+              and etiquetas[2].startswith("Estudiantes") and etiquetas[3].startswith("Docentes oficiales en la ETC"),
+              etiquetas[:4])
+        check("las advertencias de población, matrícula y docentes van en la ficha",
+              sum(1 for a in f["advertencias"] if "DANE" in a or "SIMAT" in a or "Certificada" in a) == 3)
+        f3 = llamar(S.ficha_municipio, municipio="Muni3", departamento="ANTIOQUIA")
+        check("Muni3 es su propia ETC: docentes propios y estudiantes por docente",
+              f3["docentes"]["la_etc_es_este_municipio"] is True and f3["docentes"]["docentes_oficiales"] == 840
+              and f3["docentes"]["estudiantes_oficiales_por_docente"] is not None, f3["docentes"])
+        check("y la etiqueta de la cifra no menciona la ETC",
+              [c["etiqueta"] for c in f3["vis"][0]["cifras"]][3] == "Docentes oficiales")
+        f7 = llamar(S.ficha_municipio, municipio="Muni7", departamento="ANTIOQUIA")
+        check("un municipio sin proyección DANE sigue teniendo ficha, sin habitantes",
+              f7["encontrado"] and f7["poblacion"] is None
+              and not any(c["etiqueta"].startswith("Habitantes") for c in f7["vis"][0]["cifras"]))
+
         print("\n== 3b. Un código sin cero a la izquierda no parte el municipio ==")
         fm = pd.read_parquet(datos / "fichas_municipio.parquet")
         check("hay una ficha por municipio, no dos",
@@ -360,10 +449,24 @@ def main() -> int:
         check("ficha_colegio bloquea el promedio con n<10", fp["publicable"] is False)
         check("y explica por qué", "menos de" in fp["mensaje"].lower())
 
+        print("\n== 4b. El listado de sedes: matrícula y tope configurable ==")
+        check("cada sede trae su matrícula (y la sede 2, sin dato, viene con None)",
+              any(s["matricula"] for s in c["sedes"]) and
+              all(s["matricula"] is None for s in c["sedes"] if s["cod_dane_sede"].endswith("00002")))
+        check("informa total y devueltas", c["total_sedes"] == 6 and c["sedes_devueltas"] == 6)
+        c2 = llamar(S.colegios_del_municipio, municipio=muni_peq, departamento="ANTIOQUIA", limite=2)
+        check("con limite=2 devuelve 2 de 6 y lo advierte",
+              c2["sedes_devueltas"] == 2 and c2["total_sedes"] == 6
+              and any("2 de 6" in a for a in c2["advertencias"]), c2["advertencias"])
+        c0 = llamar(S.colegios_del_municipio, municipio=muni_peq, departamento="ANTIOQUIA", limite=0)
+        check("con limite=0 devuelve todas", c0["sedes_devueltas"] == 6)
+
         print("\n== 5. Ficha de sede publicable ==")
         grande = next(s for s in c["sedes"] if s["prom_matematicas"] is not None)
         fs = llamar(S.ficha_colegio, cod_dane_sede=grande["cod_dane_sede"])
         check("publicable", fs["publicable"] is True)
+        check("la ficha de la sede trae su matrícula",
+              fs["matricula"] is None or fs["matricula"]["estudiantes"] > 0)
         check("compara contra su municipio y su departamento",
               fs["comparacion"]["diferencia_vs_municipio"] is not None
               and fs["comparacion"]["diferencia_vs_departamento"] is not None)

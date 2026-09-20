@@ -88,9 +88,15 @@ con disparo diario (`CADA_DIAS` decide cada cuántos días publica corte de
 verdad). Si está desplegado, se lanza a mano con
 `az containerapp job start -g RG_FMC_BRUJULA -n brujula-ingesta`.
 
-El contenedor clona el repositorio, instala dependencias, corre las cuatro
-fuentes, construye las fichas y publica el corte. Tarda alrededor de una hora;
-SECOP y los microdatos son los tramos largos.
+El contenedor clona el repositorio, instala dependencias, corre los pasos
+(`territorio`, `poblacion`, `datos_gov`, `matricula`, `icfes`, `secop`), construye
+las fichas y publica el corte. Tarda entre una y dos horas; SECOP, los microdatos
+del ICFES y la matrícula por sede (33 consultas agregadas a Socrata, una por
+departamento) son los tramos largos. `SALTAR=poblacion,matricula` los omite si
+hace falta un corte rápido.
+
+Para forzar un corte aunque el vigente sea reciente (por ejemplo, tras agregar
+una fuente nueva), se pasa `FORZAR=1` en las variables del contenedor.
 
 **Siempre toma la última versión de `main`.** No hay que reconstruir imagen ni
 volver a crear el contenedor: basta con subir el código al repositorio y
@@ -396,10 +402,9 @@ cambia, hay que actualizarla o el MCP responde 421.
   su primera corrida en verde).
 - **Cambiar `BRUJULA_VERSION_CACHE` desde la ingesta** al publicar un corte,
   para que no dependa de que alguien lo recuerde.
-- **Habitantes y matrícula en la ficha.** Población total (proyecciones DANE) y
-  matrícula por sede (MEN) existen como datos abiertos y caben en la ingesta.
-  Docentes por municipio no tiene fuente nacional abierta; equipos solo como el
-  acumulado histórico de Computadores Para Educar, con su advertencia.
+- **Docentes por municipio** no tiene fuente nacional abierta (solo por ETC, y
+  solo oficiales, ya incorporados). Equipos solo como el acumulado histórico de
+  Computadores Para Educar, con su advertencia.
 - **TerriData del DNP**, que es descarga de archivo, no API.
 - **Apagar el acceso elevado en Entra ID**, que sigue activo desde el
   aprovisionamiento.

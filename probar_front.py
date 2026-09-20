@@ -32,7 +32,7 @@ RAIZ = Path(__file__).resolve().parent
 WEB = RAIZ / "web"
 
 # Un servicio de mentiras: lo que el orquestador contestaría a cada ruta.
-TERRITORIOS = {"Cundinamarca": ["Soacha", "Fusagasugá"], "Nariño": ["San Andres de Tumaco"]}
+TERRITORIOS = {"Cundinamarca": ["Soacha", "Fusagasugá"], "Nariño": ["San Andres de Tumaco", "Pasto"]}
 FICHA = {
     "encontrado": True, "municipio": "San Andres de Tumaco", "departamento": "Nariño", "corte": "2026-09-20",
     "ubicacion": {"lat": 1.8, "lon": -78.8, "tipo": "Municipio", "capital_del_departamento": "Pasto",
@@ -44,6 +44,11 @@ FICHA = {
                       {"ciudad": "Cali", "departamento": "Valle del Cauca", "lat": 3.45, "lon": -76.53, "km": 314.0}],
                   "advertencia": "Distancia en línea recta, no por carretera."},
     "indicadores": {"anio": 2024, "cobertura_neta": 66.1, "poblacion_5_16": 60491},
+    "poblacion": {"anio": 2026, "habitantes": 265312, "de_5_a_18": 71400, "pct_de_5_a_18": 26.9,
+                  "fuente": "DANE — proyecciones de población 2018-2042 (CNPV 2018)"},
+    "matricula": {"anio": 2025, "estudiantes": 58210, "oficial": 52389, "no_oficial": 5821},
+    "docentes": {"anio": 2022, "entidad_territorial_certificada": "Tumaco", "la_etc_es_este_municipio": True,
+                 "docentes_oficiales": 2310, "estudiantes_oficiales_por_docente": 22.7},
     "saber11": {"sedes_evaluadas": 51},
     "economia_del_departamento": {"ambito": "Departamento de Nariño", "anio": 2023,
         "actividades_principales": [
@@ -152,7 +157,16 @@ def main() -> int:
         pagina.wait_for_selector("#inicio .datos", timeout=5000)
         pagina.wait_for_selector("#inicio svg", timeout=5000)
         inicio = pagina.inner_text("#inicio")
-        ok("60.491" in inicio, "muestra la población de 5 a 16 años")
+        etiquetas = pagina.eval_on_selector_all("#inicio .dato .e", "els => els.map(e => e.textContent)")
+        ok(etiquetas[0].startswith("Habitantes") and "DANE 2026" in etiquetas[0] and "265.312" in inicio,
+           f"primero los habitantes, con año y fuente ({etiquetas[0]})")
+        ok(etiquetas[1].startswith("Población de 5 a 18") and "71.400" in inicio and "26,9 %" in inicio,
+           "luego la población de 5 a 18 con su porcentaje")
+        ok(etiquetas[2].startswith("Estudiantes matriculados") and "58.210" in inicio and "90 % oficial" in inicio,
+           "luego los estudiantes matriculados con el peso del sector oficial")
+        ok(etiquetas[3].startswith("Docentes oficiales") and "2.310" in inicio and "23 estudiantes por docente" in inicio,
+           "luego los docentes, con estudiantes por docente porque la ETC es el municipio")
+        ok("60.491" not in inicio, "y la franja MEN de 5 a 16 ya no se repite cuando hay DANE")
         ok("178" in inicio and "Pasto" in inicio, "la distancia a la capital")
         ok("Popayán" not in inicio and "Cali" not in inicio, "sin lista de capitales cercanas: solo la propia y Bogotá")
         ok("620" in inicio and "Bogotá" in inicio, "la distancia a Bogotá")
@@ -194,6 +208,49 @@ def main() -> int:
            "con sede elegida las preguntas cambian a la sede")
         pagina.select_option("#sel-sede", "")
         ok("qué dato lo sustenta" in pagina.inner_text("#preguntas"), "y vuelven al elegir «todos»")
+
+        print("\n== 4c. Municipio grande: el desplegable se vuelve buscador ==")
+        MUCHOS = {"encontrado": True, "total": 120, "sedes": [
+            {"cod": f"1110010{i:05d}", "nombre": f"Colegio {'Bilingüe del Pacífico' if i == 77 else 'Distrital'} {i}",
+             "naturaleza": "OFICIAL", "zona": "URBANO", "evaluados": 100, "matricula": 900 + i}
+            for i in range(120)]}
+        def ruta_grande(route, request):
+            if request.url.startswith(f"{API}/colegios"):
+                return route.fulfill(status=200, content_type="application/json",
+                    headers={"access-control-allow-origin": "*"}, body=json.dumps(MUCHOS, ensure_ascii=False))
+            return ruta(route, request)
+        pagina.unroute(f"{API}/**"); pagina.route(f"{API}/**", ruta_grande)
+        pagina.select_option("#sel-mun", "Pasto")
+        pagina.wait_for_selector("#buscador-sede:not([hidden])", timeout=5000)
+        ok(pagina.eval_on_selector("#sel-sede", "e => e.hidden") is True, "con 120 colegios el desplegable se esconde")
+        ok(pagina.eval_on_selector("#sel-sede", "e => e.options.length") == 121, "pero guarda las 120 opciones")
+        ok("escribe parte del nombre" in pagina.inner_text("#nota-sede").lower(), "y la nota explica cómo buscar")
+        pagina.fill("#buscar-sede", "pacifico bilingue")
+        pagina.wait_for_selector("#lista-sedes li", timeout=3000)
+        items = pagina.eval_on_selector_all("#lista-sedes li[data-i]", "els => els.map(e => e.textContent)")
+        ok(len(items) == 1 and "Bilingüe del Pacífico" in items[0], f"busca sin tildes y en cualquier orden ({items})")
+        ok("977 estudiantes" in items[0], "y muestra la matrícula de cada resultado")
+        pagina.keyboard.press("Enter")
+        ok(pagina.eval_on_selector("#sel-sede", "e => e.value") == "Colegio Bilingüe del Pacífico 77",
+           "Enter elige el colegio y lo deja en el selector")
+        ok("bilingüe" in pagina.inner_text("#chip-alcance").lower(), "el chip del ámbito lo refleja")
+        ok(pagina.eval_on_selector("#sede-elegida", "e => !e.hidden") and "Pacífico" in pagina.inner_text("#sede-elegida"),
+           "y se ve cuál quedó elegido")
+        pagina.fill("#buscar-sede", "zzzz")
+        pagina.wait_for_selector("#lista-sedes li.nada", timeout=3000)
+        ok(True, "sin coincidencias lo dice en vez de quedarse en blanco")
+        pagina.click("#quitar-sede")
+        ok(pagina.eval_on_selector("#sel-sede", "e => e.value") == "" and pagina.eval_on_selector("#sede-elegida", "e => e.hidden"),
+           "«Todos los colegios» vuelve al municipio entero")
+        pagina.fill("#buscar-sede", "distrital 1")
+        pagina.wait_for_selector("#lista-sedes li[data-i]", timeout=3000)
+        pagina.click("#lista-sedes li[data-i]")
+        ok(pagina.eval_on_selector("#sel-sede", "e => e.value").startswith("Colegio Distrital 1"), "el clic también elige")
+        ok(not errores, "sin errores de JavaScript en el buscador" + (f" → {errores[0][:90]}" if errores else ""))
+        pagina.unroute(f"{API}/**"); pagina.route(f"{API}/**", ruta)
+        pagina.select_option("#sel-mun", "San Andres de Tumaco")
+        pagina.wait_for_selector("#sel-sede:not([hidden])", timeout=5000)
+        ok(pagina.eval_on_selector("#buscador-sede", "e => e.hidden") is True, "con pocos colegios vuelve el desplegable")
 
         print("\n== 5. Una pregunta se pinta bien ==")
         pagina.fill("#pregunta", "¿Cómo está la cobertura?")

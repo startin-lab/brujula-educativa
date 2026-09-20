@@ -20,6 +20,9 @@ español, citando siempre la fuente y la fecha de corte.
 | Computadores Para Educar (`pyqj-s96k`) | MinTIC | Qué recibió ya cada municipio: equipos, docentes formados, inversión | 2010 – 2022 |
 | Indicadores de infraestructura (`3ncw-3qwq`) | MinEducación | Aulas nuevas y mejoradas por sede | hasta 2021 |
 | SECOP Integrado (`rpmr-utcd`) | Colombia Compra Eficiente | Contratos cuyo objeto menciona educación, por municipio de la entidad | 2026-09 |
+| Proyecciones de población municipal 2018-2042 (Excel, CNPV 2018) | DANE | Habitantes de cada municipio en el año en curso, cabecera/rural, y población de 5 a 16 y de 5 a 18 años por edad simple | actualizado 30/07/2025 |
+| Matrícula en preescolar, básica y media (`ngw5-c5nw`) | MinEducación | Estudiantes matriculados (SIMAT) por municipio y por sede, oficial y no oficial, urbano y rural | 2010 – 2025 |
+| Docentes oficiales EPBM (`pgrh-8um9`) | MinEducación | Docentes del sector oficial por Entidad Territorial Certificada | hasta 2022 |
 | DIVIPOLA municipios (`gdxc-w37w`) | DANE | Los 1.122 municipios con código oficial y coordenadas | vigente |
 | DIVIPOLA centros poblados (`xaxy-8nri`) | DANE | 8.161 poblados con nombre propio y coordenadas | vigente |
 | PIB departamental (`kgyi-qc7j`) | DANE | De qué vive cada departamento: 13 actividades económicas | 2005 – 2023 |
@@ -35,9 +38,17 @@ estimaciones.
 Una herramienta de datos vale por lo que reconoce que ignora. Estas limitaciones
 están documentadas a propósito y se declaran en las respuestas:
 
-- **Docentes.** No existe un dataset nacional abierto de planta docente de básica
-  y media. Lo único disponible es el conteo de docentes *formados* dentro de
-  Computadores Para Educar.
+- **Docentes por municipio o por colegio.** Lo único abierto son los docentes
+  *oficiales* por Entidad Territorial Certificada (los 32 departamentos y unas 65
+  ciudades). Si el municipio es una ETC —Soacha, Tumaco, las capitales— la cifra
+  es suya; si no, es la del departamento entero y la ficha lo dice así. El MEN
+  tenía una base por establecimiento (`fjw5-pzau`) que ya no es pública. Además
+  los años 2015-2021 de la base por ETC vienen duplicados; solo 2022 es verosímil.
+- **La población es proyección.** El DANE proyecta desde el Censo 2018 y revisa las
+  cifras cada tanto: el «2026» de hoy no será el «2026» de dentro de dos años. Por
+  eso cada cifra lleva el año y la fecha de actualización del DANE.
+- **La matrícula es la reportada al SIMAT**, no un censo. Los colegios privados
+  reportan menos y peor que los oficiales.
 - **2023.** Los microdatos públicos terminan en 2022 y el archivo agregado de ese
   año está dañado en el servidor del ICFES. No hay resultados por colegio para 2023.
 - **Por grado.** La cobertura viene por nivel (transición, primaria, secundaria,
@@ -269,6 +280,8 @@ ingest_icfes.py       Descarga y normaliza los agregados del ICFES
 ingest_datos_gov.py   MEN municipal, Computadores Para Educar y microdatos
 ingest_secop.py       Contratación pública con objeto educativo, por municipio
 ingest_territorio.py  Ubicación de municipios y poblados, y economía departamental
+ingest_poblacion.py   Habitantes y población en edad escolar por municipio (DANE, Excel)
+ingest_matricula.py   Matrícula por municipio y por sede, y docentes por ETC (MEN)
 construir_fichas.py   Precalcula las fichas por municipio y por sede
 server.py             Servidor MCP con las herramientas de consulta
 probar_server.py      Pruebas del servidor, sin tocar la red
@@ -283,6 +296,8 @@ python ingest_icfes.py --salida ./data
 python ingest_datos_gov.py --salida ./data
 python ingest_secop.py --salida ./data
 python ingest_territorio.py --salida ./data
+python ingest_poblacion.py --salida ./data
+python ingest_matricula.py --salida ./data
 python construir_fichas.py --datos ./data --salida ./data
 ```
 

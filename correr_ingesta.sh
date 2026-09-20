@@ -3,8 +3,9 @@
 # Brújula Educativa — Corrida completa de ingesta
 # Fundación Startin
 #
-# Lo que ejecuta el contenedor: baja el código, trae los datos de las cinco
-# fuentes, construye las fichas y publica un corte fechado en Blob Storage.
+# Lo que ejecuta el contenedor: baja el código, trae los datos de las fuentes
+# (territorio y población DANE, indicadores, matrícula y docentes del MEN, ICFES,
+# MinTIC, SECOP), construye las fichas y publica un corte fechado en Blob Storage.
 #
 # Está pensado para correr SOLO, sin nadie mirando: una vez ahora y una vez al
 # mes. Por eso cada paso registra cuánto tardó y en qué terminó, y por eso una
@@ -89,7 +90,7 @@ else
 fi
 
 # --- Antes de gastar un minuto: ¿está de pie el portal de datos abiertos?
-# --- Tres de las cinco fuentes viven en datos.gov.co (Socrata), y una de ellas
+# --- Casi todas las fuentes viven en datos.gov.co (Socrata), y una de ellas
 # --- es el MEN, que define el universo de municipios. Sin MEN no hay fichas y
 # --- sin fichas no hay publicación, así que insistir con las otras sería gastar
 # --- contenedor para no producir nada. Una consulta de una fila lo responde.
@@ -126,7 +127,9 @@ fi
 # --- porque es el más rápido, y si falla algo del entorno se ve en 5 segundos
 # --- en vez de a la media hora.
 paso territorio  python3 ingest_territorio.py --salida "$DATOS"
+paso poblacion   python3 ingest_poblacion.py   --salida "$DATOS"
 paso datos_gov   python3 ingest_datos_gov.py  --salida "$DATOS"
+paso matricula   python3 ingest_matricula.py  --salida "$DATOS"
 paso icfes       python3 ingest_icfes.py      --salida "$DATOS"
 paso secop       python3 ingest_secop.py      --salida "$DATOS"
 
@@ -145,7 +148,7 @@ echo ""
 echo "================================================================"
 printf "%-14s %-12s %10s\n" "PASO" "ESTADO" "SEGUNDOS"
 echo "----------------------------------------------------------------"
-for p in territorio datos_gov icfes secop fichas publicar; do
+for p in territorio poblacion datos_gov matricula icfes secop fichas publicar; do
   printf "%-14s %-12s %10s\n" "$p" "${RESULTADO[$p]:-?}" "${SEGUNDOS[$p]:-0}"
 done
 echo "================================================================"

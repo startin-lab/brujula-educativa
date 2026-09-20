@@ -71,6 +71,10 @@ ARCHIVOS = {
     "geo_mun": "territorio_municipios.parquet",
     "geo_cp": "territorio_centros_poblados.parquet",
     "economia": "economia_resumen.parquet",
+    "poblacion": "poblacion_municipios.parquet",
+    "matricula": "matricula_municipios.parquet",
+    "matricula_sede": "matricula_sedes.parquet",
+    "docentes": "docentes_etc.parquet",
 }
 
 
@@ -120,7 +124,7 @@ SQL_MEN_ULTIMO = """
 -- 2022. Tomar "la fila más reciente" devolvería nulos donde sí hay dato.
 CREATE OR REPLACE TABLE men_ultimo AS
 WITH base AS (
-    SELECT cod_municipio, municipio, departamento, cod_departamento, anio,
+    SELECT cod_municipio, municipio, departamento, cod_departamento, anio, etc,
            cobertura_neta, cobertura_bruta, desercion, aprobacion, reprobacion,
            repitencia, tasa_matriculacion, poblacion_5_16, desercion_sospechosa
     FROM men
@@ -131,6 +135,9 @@ SELECT
     any_value(municipio      ORDER BY anio DESC)      AS municipio,
     any_value(departamento   ORDER BY anio DESC)      AS departamento,
     any_value(cod_departamento ORDER BY anio DESC)    AS cod_departamento,
+    -- La Entidad Territorial Certificada que administra la educación del
+    -- municipio: la llave para cruzar docentes, que solo existen a ese nivel.
+    any_value(etc ORDER BY anio DESC) FILTER (etc IS NOT NULL) AS etc,
     max(anio)                                          AS anio_men,
     arg_max(cobertura_neta,      anio) FILTER (cobertura_neta      IS NOT NULL) AS cobertura_neta,
     arg_max(cobertura_bruta,     anio) FILTER (cobertura_bruta     IS NOT NULL) AS cobertura_bruta,
@@ -147,6 +154,32 @@ SELECT
 FROM base
 GROUP BY cod_municipio
 """
+
+SQL_POBLACION_ACTUAL = """
+-- La proyección del año en curso. Si el corte se construye en un año que el
+-- archivo aún no cubre (no debería: llega a 2042), se toma el último disponible.
+CREATE OR REPLACE TABLE poblacion_actual AS
+WITH objetivo AS (
+    SELECT CASE WHEN max(anio) >= {anio} THEN {anio} ELSE max(anio) END AS a FROM poblacion
+)
+SELECT p.cod_municipio, p.anio AS anio_poblacion, p.poblacion_total, p.poblacion_cabecera,
+       p.poblacion_rural, p.poblacion_5_16_dane, p.poblacion_5_18_dane, p.actualizacion_dane
+FROM poblacion p, objetivo WHERE p.anio = objetivo.a
+"""
+
+
+def normalizar_etc(nombre) -> str:
+    """«Boyacá (ETC)», «Boyacá» y «BOYACA» son la misma entidad."""
+    import re
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(nombre or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c)).upper()
+    t = re.sub(r"\(\s*ETC\s*\)", "", t)
+    # «Bogotá, D.C.» en el MEN municipal es «Bogotá» en la base de docentes.
+    t = re.sub(r"\bD\.?\s*C\.?", "", t)
+    t = re.sub(r"[^A-Z0-9 ]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
 
 SQL_SABER_MUNICIPIO = """
 -- Resultados agregados al municipio desde los microdatos por colegio. Se
@@ -210,11 +243,11 @@ def construir_municipios(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -
     presentes = columnas_de(con, "men")
     esperadas = ["cobertura_neta", "cobertura_bruta", "desercion", "aprobacion", "reprobacion",
                  "repitencia", "tasa_matriculacion", "poblacion_5_16", "cod_departamento",
-                 "desercion_sospechosa"]
+                 "desercion_sospechosa", "etc"]
     faltantes = [c for c in esperadas if c not in presentes]
     if faltantes:
         LOG.warning("MEN sin columnas %s — se rellenan con NULL", ", ".join(faltantes))
-        tipo = {"desercion_sospechosa": "BOOLEAN", "cod_departamento": "VARCHAR"}
+        tipo = {"desercion_sospechosa": "BOOLEAN", "cod_departamento": "VARCHAR", "etc": "VARCHAR"}
         extra = ", ".join(f"CAST(NULL AS {tipo.get(c, 'DOUBLE')}) AS {c}" for c in faltantes)
         con.execute(f"CREATE OR REPLACE VIEW men AS SELECT *, {extra} FROM men")
 
@@ -244,9 +277,44 @@ def construir_municipios(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -
         joins.append("LEFT JOIN geo_mun g USING (cod_municipio)")
         campos.append("g.lat, g.lon, g.km_a_capital, g.km_a_bogota, "
                       "g.capital_departamento, g.tipo_municipio")
+    if hay["poblacion"]:
+        # Habitantes del año en curso según la proyección DANE vigente. Es la
+        # cifra que le da escala a todo lo demás: 45.000 menores en edad
+        # escolar no significan lo mismo en un municipio de 60.000 habitantes
+        # que en uno de 800.000.
+        con.execute(SQL_POBLACION_ACTUAL.format(anio=date.today().year))
+        joins.append("LEFT JOIN poblacion_actual p USING (cod_municipio)")
+        campos.append("p.anio_poblacion, p.poblacion_total, p.poblacion_cabecera, "
+                      "p.poblacion_rural, p.poblacion_5_16_dane, p.poblacion_5_18_dane, "
+                      "p.actualizacion_dane")
+    if hay["matricula"]:
+        joins.append("LEFT JOIN matricula t USING (cod_municipio)")
+        campos.append("t.anio_matricula, t.matricula_total, t.matricula_oficial, "
+                      "t.matricula_no_oficial, t.matricula_rural")
 
     extra = (", " + ", ".join(campos)) if campos else ""
     df = con.execute(f"SELECT m.* {extra} FROM men_ultimo m {' '.join(joins)}").fetchdf()
+
+    # ------------------------------------------------------------------ #
+    # Docentes — por Entidad Territorial Certificada, nunca inventados por
+    # municipio. El MEN solo publica docentes oficiales por ETC. Si el
+    # municipio ES una ETC (Soacha, Tumaco, las capitales), la cifra es suya;
+    # si no, es la del departamento entero y se marca como tal para que la
+    # ficha lo diga en vez de dejar que parezca un dato local.
+    # ------------------------------------------------------------------ #
+    if hay["docentes"] and "etc" in df.columns:
+        doc = con.execute("SELECT etc_norm, etc AS etc_docentes, docentes_oficiales, "
+                          "docentes_rurales, anio_docentes FROM docentes").fetchdf()
+        df["etc_norm"] = df["etc"].map(normalizar_etc)
+        df = df.merge(doc, on="etc_norm", how="left")
+        df["docentes_de_este_municipio"] = df["etc_norm"] == df["municipio"].map(normalizar_etc)
+        # Cuántos municipios comparten la ETC: sin esto, «8.045 docentes» en la
+        # ficha de un pueblo de Boyacá parece un dato del pueblo.
+        df["municipios_en_la_etc"] = df.groupby("etc_norm")["cod_municipio"].transform("count")
+        df = df.drop(columns=["etc_norm"])
+        LOG.info("Docentes: %s municipios con ETC cruzada, %s son ETC propia",
+                 int(df["docentes_oficiales"].notna().sum()),
+                 int(df["docentes_de_este_municipio"].sum()))
 
     # ------------------------------------------------------------------ #
     # Contexto territorial
@@ -325,6 +393,24 @@ def construir_municipios(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -
         df["mediana_depto_contratacion"] = (
             df.groupby("departamento")["contratacion_por_menor"].transform("median").round(0)
         )
+
+    # ------------------------------------------------------------------ #
+    # Escala: qué parte del municipio está en edad escolar y cuántos de esos
+    # están matriculados. Solo se calcula con las dos cifras del mismo origen.
+    # ------------------------------------------------------------------ #
+    if "poblacion_total" in df.columns and "poblacion_5_18_dane" in df.columns:
+        df["pct_poblacion_5_18"] = (
+            df["poblacion_5_18_dane"] / df["poblacion_total"].where(df["poblacion_total"] > 0) * 100
+        ).round(1)
+    if "matricula_total" in df.columns and "docentes_de_este_municipio" in df.columns:
+        # Estudiantes oficiales por docente oficial, y SOLO donde el municipio
+        # es su propia ETC: en los demás el numerador es del pueblo y el
+        # denominador del departamento, y dividirlos no significa nada.
+        propio = df["docentes_de_este_municipio"] & (df["docentes_oficiales"] > 0)
+        df["estudiantes_por_docente_oficial"] = pd.NA
+        df.loc[propio, "estudiantes_por_docente_oficial"] = (
+            df.loc[propio, "matricula_oficial"] / df.loc[propio, "docentes_oficiales"]
+        ).round(1)
 
     # ------------------------------------------------------------------ #
     # Señales — dónde mirar, no qué concluir
@@ -414,6 +500,15 @@ def construir_sedes(con: duckdb.DuckDBPyConnection, hay: dict[str, bool]) -> pd.
 
     con.execute(SQL_SEDES.format(ventana=PERIODOS_TENDENCIA))
     df = con.execute("SELECT * FROM sede_base").fetchdf()
+
+    if hay["matricula_sede"]:
+        # Cuántos estudiantes tiene la sede, todos los grados. Saber 11 solo ve
+        # a los de once; la matrícula dice el tamaño real del colegio.
+        ms = con.execute("SELECT cod_dane_sede, matricula AS matricula_sede, "
+                         "anio_matricula FROM matricula_sede").fetchdf()
+        df = df.merge(ms, on="cod_dane_sede", how="left")
+        LOG.info("Matrícula por sede: %s de %s sedes con dato",
+                 int(df["matricula_sede"].notna().sum()), len(df))
 
     # Comparación contra el municipio y contra el departamento. Un colegio se
     # juzga frente a sus pares, no frente a una media nacional que mezcla
@@ -547,6 +642,9 @@ def escribir_metadatos(salida: Path, hay: dict[str, bool], n_mun: int, n_sede: i
             "Las comparaciones son dentro del departamento, nunca contra el promedio nacional.",
             "El PIB solo existe por departamento: es contexto regional, no cifra del municipio.",
             "Las distancias son en línea recta, no por carretera.",
+            "La población son proyecciones DANE (CNPV 2018) del año en curso; el DANE las revisa.",
+            "La matrícula es la reportada al SIMAT; el sector privado reporta menos y peor que el oficial.",
+            "Los docentes son solo del sector oficial y solo por Entidad Territorial Certificada: para un municipio no certificado la cifra es la del departamento.",
             "No hay capa nacional de veredas ni polígonos municipales: el mapa es de puntos.",
         ],
     }

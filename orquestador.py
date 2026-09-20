@@ -821,9 +821,13 @@ def crear_app():
         if not estado["herramientas"].catalogo:
             await estado["herramientas"].reintentar()
         try:
+            # limite=0: todas las sedes. La herramienta trae un tope de 40
+            # pensado para el modelo; el selector de la página necesita la
+            # lista completa —Bogotá pasa de 700— o la persona no encuentra
+            # su colegio y cree que no existe.
             datos = await estado["herramientas"].una(
                 "colegios_del_municipio",
-                {"departamento": dep, "municipio": mun, "orden": "nombre"})
+                {"departamento": dep, "municipio": mun, "orden": "nombre", "limite": 0})
         except Exception:  # noqa: BLE001
             LOG.exception("No se pudo listar las sedes de %s, %s", mun, dep)
             return JSONResponse({"motivo": "El servidor de datos no respondió."}, status_code=503)
@@ -831,10 +835,11 @@ def crear_app():
         sedes = sorted(
             [{"cod": str(x.get("cod_dane_sede") or ""), "nombre": x.get("nombre") or "",
               "naturaleza": x.get("naturaleza") or "", "zona": x.get("zona") or "",
-              "evaluados": x.get("evaluados")}
+              "evaluados": x.get("evaluados"), "matricula": x.get("matricula")}
              for x in datos.get("sedes", []) if x.get("nombre")],
             key=lambda x: x["nombre"].casefold())
         salida = {"encontrado": bool(datos.get("encontrado")), "sedes": sedes,
+                  "total": int(datos.get("total_sedes") or len(sedes)),
                   "fuente": "ICFES — Saber 11: solo colegios con estudiantes evaluados en grado 11."}
         if sedes:
             if len(listas) > 1500:

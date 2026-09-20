@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pandas as pd
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -141,6 +142,19 @@ AVISO_MAPA = (
 )
 
 AVISO_DISTANCIA = "Distancia en línea recta, no por carretera."
+AVISO_POBLACION = (
+    "Población según las proyecciones del DANE (Censo 2018) para el año en curso. "
+    "Son proyecciones, no un conteo: el DANE las revisa periódicamente."
+)
+AVISO_MATRICULA = (
+    "Matrícula reportada por los colegios al SIMAT (Ministerio de Educación), todos los "
+    "grados de preescolar, básica y media. El sector privado reporta menos y peor que el oficial."
+)
+AVISO_DOCENTES = (
+    "Docentes SOLO del sector oficial y SOLO por Entidad Territorial Certificada (ETC). "
+    "Si el municipio no es una ETC, la cifra es la de todo el departamento y no se puede "
+    "atribuir al municipio. No existe dato abierto de docentes por municipio ni por colegio."
+)
 
 AVISO_ECONOMIA = (
     "El PIB solo se publica por departamento. Es contexto regional, no una cifra "
@@ -253,6 +267,16 @@ def existe(vista: str) -> bool:
         return False
 
 
+def columnas(vista: str) -> set[str]:
+    """Qué columnas trae una vista. Las fichas cambian entre cortes: una columna
+    nueva (matrícula, población) puede faltar en un corte viejo y el servidor
+    tiene que seguir sirviendo lo que sí hay."""
+    try:
+        return {r[0] for r in conexion().execute(f"DESCRIBE {vista}").fetchall()}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def sin_tildes(texto: str) -> str:
     """Para que 'Bogota' encuentre 'BOGOTÁ D.C.' y 'Magui' encuentre 'MAGÜÍ'."""
     t = unicodedata.normalize("NFKD", texto or "")
@@ -300,8 +324,13 @@ def vacio(mensaje: str, sugerencia: str = "") -> dict[str, Any]:
 
 
 def redondear(valor: Any, decimales: int = 1) -> float | None:
+    """
+    Un NaN de pandas no es un número: es un hueco. Devolverlo tal cual lo
+    convierte en un «NaN» dentro del JSON, que el orquestador tolera pero el
+    navegador no, y la respuesta entera se pierde por una celda vacía.
+    """
     try:
-        if valor is None:
+        if valor is None or pd.isna(valor):
             return None
         return round(float(valor), decimales)
     except (TypeError, ValueError):
@@ -624,17 +653,41 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
     if f.get("n_senales"):
         advertencias.append(AVISO_SENALES)
 
+    if f.get("poblacion_total") is not None:
+        advertencias.append(AVISO_POBLACION)
+    if f.get("matricula_total") is not None:
+        advertencias.append(AVISO_MATRICULA)
+    if f.get("docentes_oficiales") is not None:
+        advertencias.append(AVISO_DOCENTES)
+
+    def _ent(valor):
+        try:
+            return None if valor is None or pd.isna(valor) else int(valor)
+        except (TypeError, ValueError):
+            return None
+
+    docentes_propios = f.get("docentes_de_este_municipio") is True or (
+        isinstance(f.get("docentes_de_este_municipio"), (bool, int)) and bool(f["docentes_de_este_municipio"]))
     cifras = [
+        {"etiqueta": f"Habitantes · DANE {_ent(f.get('anio_poblacion')) or ''}".strip(),
+         "valor": _ent(f.get("poblacion_total")), "unidad": ""},
+        {"etiqueta": "Población de 5 a 18 años", "valor": _ent(f.get("poblacion_5_18_dane")), "unidad": ""},
+        {"etiqueta": f"Estudiantes matriculados · {_ent(f.get('anio_matricula')) or ''}".strip(),
+         "valor": _ent(f.get("matricula_total")), "unidad": ""},
+        {"etiqueta": ("Docentes oficiales" if docentes_propios
+                      else f"Docentes oficiales en la ETC {f.get('etc_docentes') or ''}").strip(),
+         "valor": _ent(f.get("docentes_oficiales")), "unidad": ""},
         {"etiqueta": "Cobertura neta", "valor": redondear(f.get("cobertura_neta")), "unidad": "%"},
         {"etiqueta": "Deserción", "valor": redondear(f.get("desercion")), "unidad": "%"},
         {"etiqueta": "Aprobación", "valor": redondear(f.get("aprobacion")), "unidad": "%"},
-        {"etiqueta": "Población 5 a 16 años", "valor": f.get("poblacion_5_16"), "unidad": ""},
         {"etiqueta": "Sedes evaluadas", "valor": f.get("sedes_evaluadas"), "unidad": ""},
         {"etiqueta": "Con internet en casa", "valor": redondear(f.get("pct_internet")), "unidad": "%"},
         {"etiqueta": "Sedes rurales", "valor": redondear(f.get("pct_sedes_rurales")), "unidad": "%"},
         {"etiqueta": "Km a la capital del departamento",
          "valor": redondear(f.get("km_a_capital")), "unidad": "km"},
     ]
+
+    cifras = [c for c in cifras if c["valor"] is not None]
 
     comparadas = {
         "tipo": VIS_BARRAS_COMP,
@@ -698,6 +751,38 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
         "cod_municipio": f["cod_municipio"],
         "ubicacion": ubicacion,
         "poblados": poblados,
+        "poblacion": {
+            "anio": _ent(f.get("anio_poblacion")),
+            "habitantes": _ent(f.get("poblacion_total")),
+            "cabecera": _ent(f.get("poblacion_cabecera")),
+            "rural": _ent(f.get("poblacion_rural")),
+            "de_5_a_16": _ent(f.get("poblacion_5_16_dane")),
+            "de_5_a_18": _ent(f.get("poblacion_5_18_dane")),
+            "pct_de_5_a_18": redondear(f.get("pct_poblacion_5_18")),
+            "fuente": "DANE — proyecciones de población 2018-2042 (CNPV 2018)",
+            "actualizacion_dane": f.get("actualizacion_dane"),
+            "advertencia": AVISO_POBLACION,
+        } if f.get("poblacion_total") is not None else None,
+        "matricula": {
+            "anio": _ent(f.get("anio_matricula")),
+            "estudiantes": _ent(f.get("matricula_total")),
+            "oficial": _ent(f.get("matricula_oficial")),
+            "no_oficial": _ent(f.get("matricula_no_oficial")),
+            "rural": _ent(f.get("matricula_rural")),
+            "fuente": "Ministerio de Educación Nacional — SIMAT",
+            "advertencia": AVISO_MATRICULA,
+        } if f.get("matricula_total") is not None else None,
+        "docentes": {
+            "anio": _ent(f.get("anio_docentes")),
+            "entidad_territorial_certificada": f.get("etc_docentes"),
+            "la_etc_es_este_municipio": docentes_propios,
+            "municipios_que_comparten_la_etc": _ent(f.get("municipios_en_la_etc")),
+            "docentes_oficiales": _ent(f.get("docentes_oficiales")),
+            "docentes_oficiales_rurales": _ent(f.get("docentes_rurales")),
+            "estudiantes_oficiales_por_docente": redondear(f.get("estudiantes_por_docente_oficial")),
+            "fuente": "Ministerio de Educación Nacional — docentes oficiales EPBM",
+            "advertencia": AVISO_DOCENTES,
+        } if f.get("docentes_oficiales") is not None else None,
         "economia_del_departamento": economia,
         "indicadores": {
             "anio": int(anio_men) if anio_men else None,
@@ -741,7 +826,7 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
             "advertencia": AVISO_SECOP,
         },
         "senales": explicar(f.get("senales")),
-        "fuente": "ICFES, Ministerio de Educación Nacional, MinTIC, Colombia Compra Eficiente",
+        "fuente": "DANE, ICFES, Ministerio de Educación Nacional, MinTIC, Colombia Compra Eficiente",
         "corte": corte(),
         "advertencias": advertencias,
         "vis": [
@@ -749,7 +834,7 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
                 "tipo": VIS_CIFRAS,
                 "titulo": f"{f['municipio']}, {f['departamento']}",
                 "cifras": cifras,
-                "nota_fuente": f"MEN {int(anio_men) if anio_men else ''} · ICFES {f.get('periodo_saber','')}",
+                "nota_fuente": f"DANE · MEN {int(anio_men) if anio_men else ''} · ICFES {f.get('periodo_saber','')}",
                 "advertencias": advertencias,
             },
             comparadas,
@@ -781,13 +866,17 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = "resultado") -> dict[str, Any]:
+def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = "resultado",
+                           limite: int = MAX_LISTA) -> dict[str, Any]:
     """
-    Las sedes de un municipio con su último resultado de Saber 11.
+    Las sedes de un municipio con su último resultado de Saber 11 y su matrícula.
 
     `orden`: "resultado" (de mayor a menor), "senales" (primero las que tienen más
     puntos por revisar) o "nombre". Las sedes con menos de diez evaluados aparecen
     sin promedio, no se ocultan: que un colegio sea pequeño es información.
+
+    `limite`: cuántas sedes devolver (40 por defecto; 0 = todas). Bogotá tiene
+    cientos: pide todas solo si vas a listarlas o filtrarlas, no para razonar.
     """
     if not existe("fichas_sede"):
         return vacio("Las fichas por sede no están cargadas.")
@@ -807,12 +896,22 @@ def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = 
         "nombre": "nombre_sede",
     }.get(orden, "prom_matematicas DESC NULLS LAST")
 
+    columnas_sede = columnas("fichas_sede")
+    con_matricula = "matricula_sede" in columnas_sede
+    extra = ", matricula_sede, anio_matricula" if con_matricula else ""
+    try:
+        tope = int(limite)
+    except (TypeError, ValueError):
+        tope = MAX_LISTA
+    total = conexion().execute(
+        "SELECT count(*) FROM fichas_sede WHERE cod_municipio = ?", [f["cod_municipio"]]
+    ).fetchone()[0]
     df = conexion().execute(f"""
         SELECT cod_dane_sede, nombre_sede, naturaleza, zona, evaluados,
                muestra_suficiente, prom_matematicas, prom_lectura, pct_internet,
-               dif_vs_depto, cambio_matematicas, n_senales, senales
+               dif_vs_depto, cambio_matematicas, n_senales, senales{extra}
         FROM fichas_sede WHERE cod_municipio = ?
-        ORDER BY {criterio} LIMIT {MAX_LISTA}
+        ORDER BY {criterio} {f"LIMIT {tope}" if tope > 0 else ""}
     """, [f["cod_municipio"]]).fetchdf()
 
     if df.empty:
@@ -836,19 +935,25 @@ def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = 
             "nota": None if suficiente else f"Menos de {MUESTRA_MINIMA} evaluados: no se publica promedio.",
             "diferencia_vs_departamento": redondear(r.dif_vs_depto) if suficiente else None,
             "cambio_en_tres_periodos": redondear(r.cambio_matematicas) if suficiente else None,
+            "matricula": (int(r.matricula_sede) if con_matricula and not pd.isna(r.matricula_sede)
+                          else None),
             "senales": explicar(r.senales),
         })
 
     publicables = [s for s in sedes if s["prom_matematicas"] is not None]
+    advertencias = [AVISO_SENALES] if any(s["senales"] for s in sedes) else []
+    if total > len(sedes):
+        advertencias.append(f"Se muestran {len(sedes)} de {total} sedes. Pide limite=0 para todas.")
     return {
         "encontrado": True,
         "municipio": f["municipio"],
         "departamento": f["departamento"],
-        "total_sedes": len(sedes),
+        "total_sedes": int(total),
+        "sedes_devueltas": len(sedes),
         "sedes": sedes,
-        "fuente": "ICFES — Saber 11",
+        "fuente": "ICFES — Saber 11" + (" · MEN — SIMAT (matrícula)" if con_matricula else ""),
         "corte": corte(),
-        "advertencias": [AVISO_SENALES] if any(s["senales"] for s in sedes) else [],
+        "advertencias": advertencias,
         "vis": {
             "tipo": VIS_TABLA,
             "titulo": f"Sedes de {f['municipio']}",
@@ -923,6 +1028,12 @@ def ficha_colegio(cod_dane_sede: str) -> dict[str, Any]:
         "zona": s["zona"],
         "periodo": s["periodo_saber"],
         "evaluados": int(s["evaluados"]),
+        "matricula": {
+            "estudiantes": int(s["matricula_sede"]),
+            "anio": int(s["anio_matricula"]),
+            "fuente": "Ministerio de Educación Nacional — SIMAT",
+            "advertencia": AVISO_MATRICULA,
+        } if s.get("matricula_sede") is not None and not pd.isna(s["matricula_sede"]) else None,
         "promedios": {v: redondear(s.get(k)) for k, v in AREAS.items()},
         "comparacion": {
             "mediana_municipio_matematicas": redondear(s.get("mediana_municipio_matematicas")),

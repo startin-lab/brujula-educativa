@@ -72,11 +72,14 @@ def listar_municipios(departamento: str) -> str:
 
 
 @mcp.tool()
-def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = "resultado") -> str:
+def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = "resultado",
+                           limite: int = 40) -> str:
     """Las sedes de un municipio."""
-    return json.dumps({"encontrado": True, "sedes": [
-        {"cod_dane_sede": "2", "nombre": "IE Zeta", "naturaleza": "OFICIAL", "zona": "RURAL", "evaluados": 30},
-        {"cod_dane_sede": "1", "nombre": "IE Alfa", "naturaleza": "NO OFICIAL", "zona": "URBANO", "evaluados": 90},
+    # El orquestador debe pedir limite=0 para el selector: se deja constancia
+    # en la respuesta para que la prueba lo verifique.
+    return json.dumps({"encontrado": True, "total_sedes": 2, "limite_recibido": limite, "sedes": [
+        {"cod_dane_sede": "2", "nombre": "IE Zeta", "naturaleza": "OFICIAL", "zona": "RURAL", "evaluados": 30, "matricula": 410},
+        {"cod_dane_sede": "1", "nombre": "IE Alfa", "naturaleza": "NO OFICIAL", "zona": "URBANO", "evaluados": 90, "matricula": 1200},
     ]}, ensure_ascii=False)
 
 
@@ -232,6 +235,8 @@ def _comprobar() -> int:
 
         print("\n== 4b. Las sedes del municipio y el ámbito por sede ==")
         c = cliente.get("/colegios", params={"departamento": "CUNDINAMARCA", "municipio": "Soacha"})
+        ok(c.json().get("total") == 2 and c.json()["sedes"][0].get("matricula") == 1200,
+           "el selector recibe el total y la matrícula de cada sede")
         sedes = c.json().get("sedes", [])
         ok(c.status_code == 200 and [s["nombre"] for s in sedes] == ["IE Alfa", "IE Zeta"],
            "lista las sedes ordenadas por nombre, con código")
