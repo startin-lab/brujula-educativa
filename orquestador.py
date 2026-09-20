@@ -483,6 +483,28 @@ def crear_app():
         autoriza: bool = False
         politica: str = ""
 
+    def _acreditado(portero: Any, visitante: str) -> bool:
+        """¿Este visitante trae una credencial vigente? Fallar aquí no puede
+        tumbar la consulta: en la duda se le trata como visitante libre."""
+        if not visitante:
+            return False
+        try:
+            return bool(portero.almacen.esta_acreditado(visitante))
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo comprobar la acreditación")
+            return False
+
+    def _estado_visitante(portero: Any, visitante: str, registrado: bool) -> dict:
+        if registrado:
+            return {"registrado": True, "restantes": None}
+        try:
+            usadas = portero.almacen.preguntas_usadas(visitante) if visitante else 0
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudieron leer las consultas usadas")
+            usadas = 0
+        return {"registrado": False,
+                "restantes": max(0, proxy.PREGUNTAS_LIBRES - usadas)}
+
     estado: dict[str, Any] = {}
 
     @asynccontextmanager
@@ -551,9 +573,18 @@ def crear_app():
         visitante = consulta.visitante or ip
         portero = estado["portero"]
 
+        # Sin esta línea, registrarse no servía para nada. El portero sabe
+        # saltarse el tope de diez consultas para quien se registró —recibe un
+        # parámetro `registrado` para eso—, pero aquí nunca se lo pasábamos:
+        # la credencial llegaba, se guardaba en el navegador, y el tope seguía
+        # cayendo igual a la consulta once. Quien se toma el trabajo de contar
+        # quién es y para qué merece que eso tenga efecto.
+        registrado = _acreditado(portero, visitante)
+
         veredicto = portero.evaluar(
             consulta.pregunta, ip, visitante,
             consulta.departamento, consulta.municipio,
+            registrado=registrado,
         )
         if veredicto.desde_cache and veredicto.respuesta:
             # Sale de caché: no se llama al modelo y no se descuenta nada.
@@ -583,7 +614,24 @@ def crear_app():
             consulta.departamento, consulta.municipio,
         )
         LOG.info("Consulta atendida: %s vueltas, %.4f USD", resultado["vueltas"], usd)
-        return JSONResponse({**resultado, "desde_cache": False})
+        return JSONResponse({**resultado, "desde_cache": False,
+                             **_estado_visitante(portero, visitante, registrado)})
+
+    @app.get("/estado")
+    async def estado_de_visitante(v: str = "", peticion: Request = None):
+        """
+        En qué estado llega quien abre la página: cuántas consultas libres le
+        quedan, o si ya se registró.
+
+        Existe por una razón concreta: sin esto, alguien que acaba de registrarse
+        y entra por el enlace del correo veía «10 consultas libres» en pantalla,
+        que es justo lo que su registro dejó de ser. Una cifra equivocada en el
+        sitio más visible de la página hace dudar de todo lo demás.
+        """
+        portero = estado["portero"]
+        quien = v or (_ip_del_cliente(peticion) if peticion else "")
+        registrado = _acreditado(portero, quien)
+        return JSONResponse(_estado_visitante(portero, quien, registrado))
 
     @app.post("/registrar")
     async def registrar(datos: Registro) -> JSONResponse:
