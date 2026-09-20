@@ -216,6 +216,32 @@ class Herramientas:
             LOG.warning("El servidor MCP sigue sin responder: %s", exc)
         return bool(self._catalogo)
 
+    async def territorios(self) -> dict[str, list[str]]:
+        """
+        El mapa completo: cada departamento con sus municipios.
+
+        La página necesita esto para armar los dos desplegables, y no puede
+        salir de una consulta normal: preguntarle al modelo «dame la lista de
+        municipios» costaría una llamada al modelo cada vez que alguien abre la
+        página, para devolver algo que no cambia entre cortes.
+
+        Son 33 consultas a DuckDB sobre una sola sesión, de milisegundos cada
+        una. El resultado se guarda en memoria del lado del orquestador.
+        """
+        async with self.sesion() as ses:
+            lista = await self.llamar(ses, "listar_departamentos", {}, False)
+            mapa: dict[str, list[str]] = {}
+            for fila in lista.get("departamentos", []):
+                nombre = (fila or {}).get("departamento")
+                if not nombre:
+                    continue
+                municipios = await self.llamar(
+                    ses, "listar_municipios", {"departamento": nombre}, False)
+                mapa[nombre] = [m["municipio"]
+                                for m in municipios.get("municipios", [])
+                                if (m or {}).get("municipio")]
+        return mapa
+
     async def cerrar(self) -> None:
         return None
 
@@ -665,6 +691,36 @@ def crear_app():
         LOG.info("Consulta atendida: %s vueltas, %.4f USD", resultado["vueltas"], usd)
         return JSONResponse({**resultado, "desde_cache": False,
                              **_estado_visitante(portero, visitante, registrado)})
+
+    @app.get("/territorios")
+    async def territorios():
+        """
+        Los departamentos y municipios que hay en el corte vigente.
+
+        Existe porque la página traía la lista escrita a mano —dos
+        departamentos y diez municipios, de cuando era una maqueta—. Alguien de
+        Nariño abría Brújula, no encontraba su departamento y se iba con la
+        idea de que la herramienta no cubre su territorio. Cubre los 1.100 y
+        pico municipios del país; lo que faltaba era decirlo.
+        """
+        guardado = estado.get("territorios")
+        if guardado and time.time() - guardado["cuando"] < 6 * 3600:
+            return JSONResponse(guardado["mapa"],
+                                headers={"cache-control": "public, max-age=3600"})
+
+        if not estado["herramientas"].catalogo:
+            await estado["herramientas"].reintentar()
+        try:
+            mapa = await estado["herramientas"].territorios()
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo armar la lista de territorios")
+            # Sin lista, la página se queda con la suya: es mejor que un
+            # desplegable vacío.
+            return JSONResponse({}, status_code=503)
+
+        if mapa:
+            estado["territorios"] = {"mapa": mapa, "cuando": time.time()}
+        return JSONResponse(mapa, headers={"cache-control": "public, max-age=3600"})
 
     @app.get("/estado")
     async def estado_de_visitante(v: str = "", peticion: Request = None):

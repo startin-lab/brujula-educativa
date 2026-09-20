@@ -53,6 +53,25 @@ mcp = FastMCP("falso", transport_security=TransportSecuritySettings(
                      "http://127.0.0.1", "http://127.0.0.1:*"]))
 
 @mcp.tool()
+def listar_departamentos() -> str:
+    """Los departamentos disponibles."""
+    return json.dumps({"encontrado": True, "departamentos": [
+        {"departamento": "CUNDINAMARCA", "municipios": 2},
+        {"departamento": "NARIÑO", "municipios": 1},
+    ]}, ensure_ascii=False)
+
+
+@mcp.tool()
+def listar_municipios(departamento: str) -> str:
+    """Los municipios de un departamento."""
+    mapa = {"CUNDINAMARCA": ["Soacha", "Fusagasugá"], "NARIÑO": ["Túquerres"]}
+    return json.dumps({"encontrado": True, "departamento": departamento,
+                       "municipios": [{"municipio": m}
+                                      for m in mapa.get(departamento, [])]},
+                      ensure_ascii=False)
+
+
+@mcp.tool()
 def ficha_municipio(departamento: str, municipio: str) -> str:
     """Ficha de un municipio."""
     return json.dumps({
@@ -160,7 +179,7 @@ def _comprobar() -> int:
     with TestClient(orquestador.crear_app()) as cliente:
         print("\n== 1. El orquestador ve el catálogo del MCP ==")
         salud = cliente.get("/salud").json()
-        ok(salud["herramientas"] == 1, "el catálogo llegó")
+        ok(salud["herramientas"] == 3, "el catálogo llegó completo")
         ok(salud["consultas"] == "abiertas", "las consultas quedan abiertas")
 
         print("\n== 2. Una pregunta cruza entera ==")
@@ -185,7 +204,18 @@ def _comprobar() -> int:
         ok(r2.status_code == 200, "la segunda consulta responde 200")
         ok(bool(d2.get("vis")), "la segunda consulta también trae datos")
 
-        print("\n== 4. El registro sigue vivo aunque no haya modelo ==")
+        print("\n== 4. La página recibe el país entero, no una maqueta ==")
+        # La lista de territorios estuvo escrita a mano en el HTML —dos
+        # departamentos— y desde fuera parecía que Brújula solo cubría esos.
+        t = cliente.get("/territorios")
+        mapa = t.json()
+        ok(t.status_code == 200, "responde 200")
+        ok(sorted(mapa) == ["CUNDINAMARCA", "NARIÑO"],
+           "llegan todos los departamentos del corte")
+        ok(mapa.get("NARIÑO") == ["Túquerres"],
+           "cada departamento trae sus municipios")
+
+        print("\n== 5. El registro sigue vivo aunque no haya modelo ==")
         r3 = cliente.post("/registrar", json={
             "nombre": "Ana Ruiz", "organizacion": "Secretaría de Boyacá",
             "correo": "ana@boyaca.gov.co", "autoriza": True,
