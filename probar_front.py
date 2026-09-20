@@ -46,7 +46,9 @@ FICHA = {
     "indicadores": {"anio": 2024, "cobertura_neta": 66.1, "poblacion_5_16": 60491},
     "saber11": {"sedes_evaluadas": 51},
     "economia_del_departamento": {"ambito": "Departamento de Nariño", "anio": 2023,
-        "actividades_principales": [{"actividad": "Agricultura", "pct_del_pib": 14.2}],
+        "actividades_principales": [
+            {"actividad": "Administración pública y defensa; planes de seguridad social de afiliación obligatoria; educación; actividades de atención de la salud humana y de servicios sociales", "pct_del_pib": 27.0},
+            {"actividad": "Agricultura, ganadería, caza, silvicultura y pesca", "pct_del_pib": 14.2}],
         "advertencia": "El PIB solo se publica por departamento."},
     "senales": [{"clave": "cobertura_neta_baja"}, {"clave": "brecha_digital_alta"}],
 }
@@ -144,7 +146,11 @@ def main() -> int:
         ok("60.491" in inicio, "muestra la población de 5 a 16 años")
         ok("178" in inicio and "Pasto" in inicio, "la distancia a la capital")
         ok("Popayán" in inicio and "Cali" in inicio, "las capitales cercanas")
-        ok("Agricultura" in inicio, "de qué vive el departamento")
+        ok("Agropecuario y pesca" in inicio and "Gobierno, educación y salud" in inicio,
+           "de qué vive el departamento, con las ramas del DANE en nombre corto")
+        ok("afiliación obligatoria" not in inicio, "sin la denominación completa de la CIIU en pantalla")
+        ok(pagina.eval_on_selector("#inicio .lista .fila b[title]", "e => e.title.includes('afiliación obligatoria')"),
+           "pero la denominación exacta se conserva en el título")
         ok("2 señales" in inicio, "cuántas señales hay, sin decir cuáles todavía")
         ok(pagina.eval_on_selector_all("#inicio svg path.dpto", "e => e.length") == 32,
            "el mapa dibuja los 32 departamentos continentales")
@@ -175,7 +181,49 @@ def main() -> int:
         ok("Cobertura neta baja" in pagina.inner_text("#bloques"), "la señal se muestra legible, no como identificador")
         ok(not errores, "sin errores de JavaScript durante la consulta" + (f" → {errores[0][:90]}" if errores else ""))
 
-        print("\n== 6. index.html arranca y muestra el aviso de enlace caducado ==")
+        print("\n== 6. Al agotar el cupo, el registro aparece en la misma página ==")
+        ok(pagina.eval_on_selector("#registro-en-linea", "e => e.hidden") is True,
+           "con cupo disponible el formulario no se ve")
+        estado_agotado = {"agotado": True}
+        def ruta_agotado(route, request):
+            url = request.url
+            if url.startswith(f"{API}/preguntar"):
+                return route.fulfill(status=402, content_type="application/json",
+                    headers={"access-control-allow-origin": "*"},
+                    body=json.dumps({"motivo": "Usaste tus 10 consultas libres."}))
+            if url.startswith(f"{API}/registrar"):
+                cuerpo = json.loads(request.post_data or "{}")
+                estado_agotado["registro"] = cuerpo
+                return route.fulfill(status=200, content_type="application/json",
+                    headers={"access-control-allow-origin": "*"},
+                    body=json.dumps({"motivo": "Listo. Te enviamos un enlace de acceso al correo."}))
+            return ruta(route, request)
+        pagina.unroute(f"{API}/**")
+        pagina.route(f"{API}/**", ruta_agotado)
+        pagina.fill("#pregunta", "¿y la deserción?")
+        pagina.click("#enviar")
+        pagina.wait_for_selector("#registro-en-linea:not([hidden])", timeout=5000)
+        ok(True, "el 402 muestra el formulario aquí mismo, sin mandar a la portada")
+        ok("registrate" in pagina.inner_text("#pie-consulta").lower().replace("í", "i"),
+           "y el mensaje dice dónde está")
+        pagina.click("#enviar-registro")
+        pagina.wait_for_timeout(300)
+        ok("autorizaci" in pagina.inner_text("#resultado").lower() or "revisa" in pagina.inner_text("#resultado").lower(),
+           "sin autorización no envía, y lo dice")
+        ok("registro" not in estado_agotado, "y no llamó al servidor")
+        pagina.fill("#nombre", "Ana Ruiz"); pagina.fill("#organizacion", "Secretaría de Nariño")
+        pagina.fill("#correo", "ana@narino.gov.co")
+        pagina.fill("#proposito", "Diagnóstico de cobertura en la costa pacífica")
+        pagina.check("#autoriza")
+        pagina.click("#enviar-registro")
+        pagina.wait_for_selector("#resultado.bien", timeout=5000)
+        reg = estado_agotado.get("registro", {})
+        ok(reg.get("correo") == "ana@narino.gov.co" and reg.get("autoriza") is True, "envía los datos y la autorización")
+        ok(reg.get("politica", "").startswith("https://startin.org.co/privacidad"), "deja constancia de qué política se aceptó")
+        ok("correo" in pagina.inner_text("#registro-titulo").lower(), "y le dice que revise el correo")
+        ok(not errores, "sin errores de JavaScript" + (f" → {errores[0][:90]}" if errores else ""))
+
+        print("\n== 7. index.html arranca y muestra el aviso de enlace caducado ==")
         errores.clear()
         pagina.goto(f"{base}/index.html?acceso=caducado")
         pagina.wait_for_timeout(500)
