@@ -50,7 +50,14 @@ Variables:
   AZURE_STORAGE_CUENTA         contadores del portero (identidad administrada)
 """
 
-from __future__ import annotations
+# OJO: aquí NO va `from __future__ import annotations`.
+#
+# Con ese import, las anotaciones de tipo quedan como texto y FastAPI las
+# resuelve contra el espacio de nombres del MÓDULO. Como los modelos de este
+# archivo se declaran dentro de crear_app(), FastAPI no los encontraba y
+# trataba el cuerpo de la petición como parámetros de URL: toda llamada
+# respondía 422 «field required» sin tocar una línea de nuestra lógica.
+# En Python 3.12 no hace falta para escribir dict[str, Any] ni str | None.
 
 import json
 import logging
@@ -408,7 +415,7 @@ def crear_app():
     from fastapi import FastAPI, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, EmailStr, Field
 
     import proxy
 
@@ -417,6 +424,14 @@ def crear_app():
         departamento: str = ""
         municipio: str = ""
         visitante: str = ""
+
+    class Registro(BaseModel):
+        nombre: str = Field(min_length=2, max_length=80)
+        organizacion: str = Field(min_length=2, max_length=120)
+        correo: EmailStr
+        proposito: str = Field(min_length=10, max_length=400)
+        autoriza: bool = False
+        politica: str = ""
 
     estado: dict[str, Any] = {}
 
