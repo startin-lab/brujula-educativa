@@ -507,6 +507,38 @@ def ubicar_lugar(nombre: str, departamento: str = "") -> dict[str, Any]:
     }
 
 
+def capitales_cercanas(lat: float | None, lon: float | None, n: int = 4) -> list[dict[str, Any]]:
+    """
+    Las capitales departamentales más cercanas a un punto, con su distancia.
+
+    Ubica al lector sin mapa: «a 20 km de Bogotá, a 110 de Tunja» le dice más
+    que un par de coordenadas. Las capitales son los municipios cuyo nombre
+    coincide con la capital declarada de su departamento; con eso salen las 32
+    y Bogotá sin mantener una lista aparte. Distancia en línea recta.
+    """
+    if lat is None or lon is None or not existe("fichas_mun"):
+        return []
+    filas = conexion().execute("""
+        WITH capitales AS (
+            SELECT DISTINCT departamento, municipio, lat, lon
+            FROM fichas_mun
+            WHERE lat IS NOT NULL AND lon IS NOT NULL
+              AND strip_accents(upper(municipio)) = strip_accents(upper(capital_departamento))
+        )
+        SELECT municipio, departamento, lat, lon,
+               2 * 6371 * asin(sqrt(
+                   pow(sin(radians(lat - ?) / 2), 2) +
+                   cos(radians(?)) * cos(radians(lat)) * pow(sin(radians(lon - ?) / 2), 2)
+               )) AS km
+        FROM capitales
+        ORDER BY km
+        LIMIT ?
+    """, [lat, lat, lon, n]).fetchall()
+    return [{"ciudad": r[0], "departamento": r[1],
+             "lat": redondear(r[2], 4), "lon": redondear(r[3], 4), "km": redondear(r[4])}
+            for r in filas]
+
+
 @mcp.tool()
 def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
     """
@@ -599,6 +631,7 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
         "sedes_rurales": f.get("sedes_rurales"),
         "sedes_total": f.get("sedes_total"),
         "pct_sedes_rurales": redondear(f.get("pct_sedes_rurales")),
+        "capitales_cercanas": capitales_cercanas(f.get("lat"), f.get("lon")),
         "advertencia": AVISO_DISTANCIA,
     }
 

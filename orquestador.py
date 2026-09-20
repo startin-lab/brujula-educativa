@@ -216,6 +216,11 @@ class Herramientas:
             LOG.warning("El servidor MCP sigue sin responder: %s", exc)
         return bool(self._catalogo)
 
+    async def una(self, nombre: str, argumentos: dict[str, Any]) -> dict[str, Any]:
+        """Una sola herramienta, sin modelo: abre sesión, llama, cierra."""
+        async with self.sesion() as ses:
+            return await self.llamar(ses, nombre, argumentos, False)
+
     async def territorios(self) -> dict[str, list[str]]:
         """
         El mapa completo: cada departamento con sus municipios.
@@ -721,6 +726,44 @@ def crear_app():
         if mapa:
             estado["territorios"] = {"mapa": mapa, "cuando": time.time()}
         return JSONResponse(mapa, headers={"cache-control": "public, max-age=3600"})
+
+    @app.get("/ficha")
+    async def ficha(departamento: str = "", municipio: str = ""):
+        """
+        El contexto de un municipio, sin modelo y sin gastar cupo.
+
+        Cuando alguien elige su territorio, antes de preguntar nada, ya debería
+        ver dónde queda, cuánta gente en edad escolar tiene, de qué vive el
+        departamento y a qué distancia están las capitales. Todo eso lo trae
+        la herramienta ficha_municipio desde hace tiempo, pero solo salía si
+        alguien gastaba una de sus consultas en pedirlo. Orientarse no debería
+        costar una pregunta.
+        """
+        dep, mun = departamento.strip(), municipio.strip()
+        if not dep or not mun:
+            return JSONResponse({"motivo": "Faltan departamento y municipio."}, status_code=400)
+
+        clave = f"{dep.casefold()}|{mun.casefold()}"
+        fichas = estado.setdefault("fichas", {})
+        guardada = fichas.get(clave)
+        if guardada and time.time() - guardada["cuando"] < 6 * 3600:
+            return JSONResponse(guardada["datos"], headers={"cache-control": "public, max-age=1800"})
+
+        if not estado["herramientas"].catalogo:
+            await estado["herramientas"].reintentar()
+        try:
+            datos = await estado["herramientas"].una(
+                "ficha_municipio", {"departamento": dep, "municipio": mun})
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo armar la ficha de %s, %s", mun, dep)
+            return JSONResponse({"motivo": "El servidor de datos no respondió."}, status_code=503)
+
+        if datos.get("encontrado"):
+            if len(fichas) > 1500:      # sin esto crecería para siempre
+                fichas.clear()
+            fichas[clave] = {"datos": datos, "cuando": time.time()}
+        return JSONResponse(datos, status_code=200 if datos.get("encontrado") else 404,
+                            headers={"cache-control": "public, max-age=1800"})
 
     @app.get("/estado")
     async def estado_de_visitante(v: str = "", peticion: Request = None):

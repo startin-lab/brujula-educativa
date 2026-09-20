@@ -23,6 +23,9 @@ POR QUÉ EXISTE
 import json
 import os
 import sys
+import threading
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent
@@ -30,6 +33,23 @@ WEB = RAIZ / "web"
 
 # Un servicio de mentiras: lo que el orquestador contestaría a cada ruta.
 TERRITORIOS = {"Cundinamarca": ["Soacha", "Fusagasugá"], "Nariño": ["San Andres de Tumaco"]}
+FICHA = {
+    "encontrado": True, "municipio": "San Andres de Tumaco", "departamento": "Nariño", "corte": "2026-09-20",
+    "ubicacion": {"lat": 1.8, "lon": -78.8, "tipo": "Municipio", "capital_del_departamento": "Pasto",
+                  "km_a_la_capital_departamental": 178, "km_a_bogota": 620, "sedes_total": 100,
+                  "sedes_rurales": 51, "pct_sedes_rurales": 51.0,
+                  "capitales_cercanas": [
+                      {"ciudad": "Pasto", "departamento": "Nariño", "lat": 1.21, "lon": -77.28, "km": 178.0},
+                      {"ciudad": "Popayán", "departamento": "Cauca", "lat": 2.44, "lon": -76.61, "km": 252.0},
+                      {"ciudad": "Cali", "departamento": "Valle del Cauca", "lat": 3.45, "lon": -76.53, "km": 314.0}],
+                  "advertencia": "Distancia en línea recta, no por carretera."},
+    "indicadores": {"anio": 2024, "cobertura_neta": 66.1, "poblacion_5_16": 60491},
+    "saber11": {"sedes_evaluadas": 51},
+    "economia_del_departamento": {"ambito": "Departamento de Nariño", "anio": 2023,
+        "actividades_principales": [{"actividad": "Agricultura", "pct_del_pib": 14.2}],
+        "advertencia": "El PIB solo se publica por departamento."},
+    "senales": [{"clave": "cobertura_neta_baja"}, {"clave": "brecha_digital_alta"}],
+}
 RESPUESTA = {
     "respuesta": "En **Tumaco** la cobertura es baja:\n\n- **Neta:** **66,1 %**\n- **Bruta:** 81,2 %\n\n"
                  "**Señales**\n1. Cobertura neta baja.\n2. Brecha digital alta.",
@@ -46,8 +66,24 @@ RESPUESTA = {
 }
 
 
+class _Silencioso(SimpleHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+
+def servir_web():
+    """
+    web/ por HTTP en un puerto libre. Abrir los HTML como file:// no sirve: el
+    navegador no deja hacer fetch() de archivos locales, y la página necesita
+    pedir el mapa. Así también se prueba tal como se publica.
+    """
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), partial(_Silencioso, directory=str(WEB)))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
 def main() -> int:
     from playwright.sync_api import sync_playwright
+    servidor, base = servir_web()
 
     fallos: list[str] = []
 
@@ -75,6 +111,7 @@ def main() -> int:
             if url.startswith(f"{API}/territorios"): cuerpo = TERRITORIOS
             elif url.startswith(f"{API}/estado"):    cuerpo = {"registrado": False, "restantes": 10}
             elif url.startswith(f"{API}/preguntar"): cuerpo = RESPUESTA
+            elif url.startswith(f"{API}/ficha"):     cuerpo = FICHA
             if cuerpo is None:
                 return route.fulfill(status=404, body="")
             route.fulfill(status=200, content_type="application/json",
@@ -83,7 +120,7 @@ def main() -> int:
         pagina.route(f"{API}/**", ruta)
 
         print("\n== 1. consultar.html arranca sin errores ==")
-        pagina.goto((WEB / "consultar.html").as_uri())
+        pagina.goto(f"{base}/consultar.html")
         pagina.wait_for_timeout(800)
         ok(not errores, "sin errores de JavaScript al cargar" + (f" → {errores[0][:90]}" if errores else ""))
 
@@ -98,9 +135,28 @@ def main() -> int:
         ok(pagina.eval_on_selector("#aviso-muestra", "e => e.hidden") is True,
            "con servicio configurado, el aviso está oculto")
 
-        print("\n== 4. Una pregunta se pinta bien ==")
+        print("\n== 4. Al elegir municipio aparece la ficha inicial, sin gastar cupo ==")
         pagina.select_option("#sel-depto", "Nariño")
         pagina.select_option("#sel-mun", "San Andres de Tumaco")
+        pagina.wait_for_selector("#inicio .datos", timeout=5000)
+        pagina.wait_for_selector("#inicio svg", timeout=5000)
+        inicio = pagina.inner_text("#inicio")
+        ok("60.491" in inicio, "muestra la población de 5 a 16 años")
+        ok("178" in inicio and "Pasto" in inicio, "la distancia a la capital")
+        ok("Popayán" in inicio and "Cali" in inicio, "las capitales cercanas")
+        ok("Agricultura" in inicio, "de qué vive el departamento")
+        ok("2 señales" in inicio, "cuántas señales hay, sin decir cuáles todavía")
+        ok(pagina.eval_on_selector_all("#inicio svg path.dpto", "e => e.length") == 32,
+           "el mapa dibuja los 32 departamentos continentales")
+        ok(pagina.eval_on_selector_all("#inicio svg path.dpto.elegido", "e => e.length") == 1,
+           "y resalta el elegido")
+        ok(pagina.eval_on_selector_all("#inicio svg circle.mun", "e => e.length") == 1, "con el municipio marcado")
+        ok(pagina.eval_on_selector_all("#inicio svg circle.cap", "e => e.length") == 3, "y las tres capitales cercanas")
+        ok("DANE" in inicio, "acredita la fuente de las siluetas")
+        ok(pagina.inner_text("#chip-cupo").strip().lower() == "10 consultas libres", "la ficha no descontó cupo")
+        ok(not errores, "sin errores de JavaScript al pintar la ficha" + (f" → {errores[0][:90]}" if errores else ""))
+
+        print("\n== 5. Una pregunta se pinta bien ==")
         pagina.fill("#pregunta", "¿Cómo está la cobertura?")
         pagina.click("#enviar")
         pagina.wait_for_selector(".vis", timeout=5000)
@@ -119,14 +175,15 @@ def main() -> int:
         ok("Cobertura neta baja" in pagina.inner_text("#bloques"), "la señal se muestra legible, no como identificador")
         ok(not errores, "sin errores de JavaScript durante la consulta" + (f" → {errores[0][:90]}" if errores else ""))
 
-        print("\n== 5. index.html arranca y muestra el aviso de enlace caducado ==")
+        print("\n== 6. index.html arranca y muestra el aviso de enlace caducado ==")
         errores.clear()
-        pagina.goto((WEB / "index.html").as_uri() + "?acceso=caducado")
+        pagina.goto(f"{base}/index.html?acceso=caducado")
         pagina.wait_for_timeout(500)
         ok(not errores, "sin errores de JavaScript")
         ok(pagina.eval_on_selector("#caducado", "e => !e.hidden"), "el aviso de enlace caducado se ve")
 
         navegador.close()
+    servidor.shutdown()
 
     print("\n" + "=" * 64)
     if fallos:

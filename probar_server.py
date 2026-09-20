@@ -434,6 +434,17 @@ def main() -> int:
         check("cuenta los poblados fuera de la cabecera",
               f["ubicacion"]["poblados_fuera_de_la_cabecera"] == 2,
               f["ubicacion"]["poblados_fuera_de_la_cabecera"])
+        # Las capitales cercanas ubican al lector sin necesidad de mapa. Salen
+        # de los propios municipios (los que se llaman como la capital de su
+        # departamento), así que no hay lista aparte que se pueda desactualizar.
+        cerca = f["ubicacion"].get("capitales_cercanas") or []
+        check("lista capitales cercanas con distancia",
+              bool(cerca) and all({"ciudad", "departamento", "km", "lat", "lon"} <= set(c) for c in cerca), cerca[:2])
+        check("ordenadas de la más cercana a la más lejana",
+              [c["km"] for c in cerca] == sorted(c["km"] for c in cerca))
+        check("la primera es la capital de su propio departamento o está más cerca que ella",
+              bool(cerca) and cerca[0]["km"] <= (f["ubicacion"]["km_a_la_capital_departamental"] or 1e9) + 0.6,
+              (cerca[0] if cerca else None, f["ubicacion"]["km_a_la_capital_departamental"]))
 
         print("\n== 13. Computadores Para Educar: histórico, no estado actual ==")
         cpe = f["computadores_para_educar"]
