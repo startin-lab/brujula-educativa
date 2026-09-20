@@ -152,10 +152,17 @@ def main() -> int:
         ok(pagina.eval_on_selector("#inicio .lista .fila b[title]", "e => e.title.includes('afiliación obligatoria')"),
            "pero la denominación exacta se conserva en el título")
         ok("2 señales" in inicio, "cuántas señales hay, sin decir cuáles todavía")
-        ok(pagina.eval_on_selector_all("#inicio svg path.dpto", "e => e.length") == 32,
+        ok(pagina.eval_on_selector_all("#inicio svg g.principal path.dpto", "e => e.length") == 32,
            "el mapa dibuja los 32 departamentos continentales")
-        ok(pagina.eval_on_selector_all("#inicio svg path.dpto.elegido", "e => e.length") == 1,
+        ok(pagina.eval_on_selector_all("#inicio svg g.principal path.dpto.elegido", "e => e.length") == 1,
            "y resalta el elegido")
+        # Acercado al departamento: el elegido ocupa una parte grande del lienzo,
+        # y un recuadro con el país entero dice dónde estamos.
+        area = pagina.eval_on_selector("#inicio svg g.principal path.dpto.elegido",
+            "e => { const b = e.getBBox(); return (b.width * b.height) / (300 * 340); }")
+        ok(area > 0.08, f"el mapa está acercado al departamento (ocupa {area:.0%} del lienzo)")
+        ok(pagina.eval_on_selector_all("#inicio svg .recuadro rect.marco", "e => e.length") == 1,
+           "con el recuadro del país indicando la zona")
         ok(pagina.eval_on_selector_all("#inicio svg circle.mun", "e => e.length") == 1, "con el municipio marcado")
         ok(pagina.eval_on_selector_all("#inicio svg circle.cap", "e => e.length") == 3, "y las tres capitales cercanas")
         ok("DANE" in inicio, "acredita la fuente de las siluetas")

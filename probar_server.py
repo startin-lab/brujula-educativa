@@ -300,6 +300,24 @@ def main() -> int:
         check("departamento inexistente no inventa",
               llamar(S.listar_municipios, departamento="Atlantico")["encontrado"] is False)
 
+        print("\n== 2b. Un nombre exacto de departamento significa solo ese departamento ==")
+        # El 20 de septiembre de 2026, «Cauca» traía también los municipios de
+        # Valle del Cauca y «Santander» los de Norte de Santander: el filtro
+        # buscaba por contención. Alcalá aparecía en Cauca con Cali de capital.
+        S._departamentos_conocidos = None          # que lo recalcule con este corte
+        cond, par = S.filtro_departamento("Cundinamarca")
+        check("con nombre exacto exige igualdad", cond.strip().endswith("= ?") and par == "CUNDINAMARCA", (cond, par))
+        cond, par = S.filtro_departamento("Cundi")
+        check("con nombre parcial busca por contención, para lo que escribe una persona",
+              "LIKE" in cond and par == "%CUNDI%", (cond, par))
+        parcial = llamar(S.listar_municipios, departamento="cundi")
+        exacto = llamar(S.listar_municipios, departamento="CUNDINAMARCA")
+        check("el nombre exacto devuelve solo sus municipios", len(exacto["municipios"]) == 20, len(exacto["municipios"]))
+        check("y el parcial sigue encontrándolo", len(parcial["municipios"]) == 20, len(parcial["municipios"]))
+        check("ningún municipio de un departamento aparece bajo el otro",
+              not {m["municipio"] for m in exacto["municipios"]} &
+                  {m["municipio"] for m in llamar(S.listar_municipios, departamento="ANTIOQUIA")["municipios"]})
+
         print("\n== 3. Ficha municipal ==")
         f = llamar(S.ficha_municipio, municipio="Muni4", departamento="ANTIOQUIA")
         check("devuelve indicadores", f["encontrado"] and f["indicadores"]["cobertura_neta"] is not None)

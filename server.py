@@ -259,6 +259,42 @@ def sin_tildes(texto: str) -> str:
     return "".join(c for c in t if not unicodedata.combining(c)).upper().strip()
 
 
+_departamentos_conocidos: set[str] | None = None
+
+
+def nombres_de_departamento() -> set[str]:
+    """Los nombres exactos (sin tildes, en mayúsculas) de los departamentos del corte."""
+    global _departamentos_conocidos
+    if _departamentos_conocidos is None and existe("fichas_mun"):
+        filas = conexion().execute("""
+            SELECT DISTINCT strip_accents(upper(departamento)) FROM fichas_mun
+            WHERE departamento IS NOT NULL
+        """).fetchall()
+        _departamentos_conocidos = {f[0] for f in filas}
+    return _departamentos_conocidos or set()
+
+
+def filtro_departamento(departamento: str) -> tuple[str, str]:
+    """
+    La condición SQL para un departamento, y su parámetro.
+
+    Si el nombre coincide exactamente con un departamento del corte, se exige
+    igualdad. Solo si no coincide con ninguno se busca por contención, que es
+    lo que permite que «Valle» encuentre a VALLE DEL CAUCA cuando el nombre lo
+    escribe una persona a medias.
+
+    El orden importa y se aprendió a las malas: buscando siempre por
+    contención, «Cauca» traía también los 42 municipios de Valle del Cauca y
+    «Santander» los 40 de Norte de Santander. Alcalá aparecía en Cauca, con
+    Cali de capital y la economía de Valle, y nada en pantalla avisaba. Un
+    nombre exacto tiene que significar exactamente ese departamento.
+    """
+    clave = sin_tildes(departamento)
+    if clave in nombres_de_departamento():
+        return "strip_accents(upper(departamento)) = ?", clave
+    return "strip_accents(upper(departamento)) LIKE ?", f"%{clave}%"
+
+
 def vacio(mensaje: str, sugerencia: str = "") -> dict[str, Any]:
     return {"encontrado": False, "mensaje": mensaje, "sugerencia": sugerencia}
 
@@ -327,8 +363,9 @@ def resolver_municipio(municipio: str, departamento: str = "") -> dict[str, Any]
     filtros = ["strip_accents(upper(municipio)) = ?"]
     params: list[Any] = [sin_tildes(municipio)]
     if departamento:
-        filtros.append("strip_accents(upper(departamento)) LIKE ?")
-        params.append(f"%{sin_tildes(departamento)}%")
+        cond, par = filtro_departamento(departamento)
+        filtros.append(cond)
+        params.append(par)
 
     filas = con.execute(
         f"SELECT * FROM fichas_mun WHERE {' AND '.join(filtros)}", params
@@ -392,12 +429,13 @@ def listar_municipios(departamento: str) -> dict[str, Any]:
     """
     if not existe("fichas_mun"):
         return vacio("Las fichas no están cargadas en el servidor.")
-    filas = conexion().execute("""
+    cond, par = filtro_departamento(departamento)
+    filas = conexion().execute(f"""
         SELECT cod_municipio, municipio, n_senales
         FROM fichas_mun
-        WHERE strip_accents(upper(departamento)) LIKE ?
+        WHERE {cond}
         ORDER BY municipio
-    """, [f"%{sin_tildes(departamento)}%"]).fetchall()
+    """, [par]).fetchall()
     if not filas:
         return vacio(
             f"No encontré el departamento «{departamento}».",
@@ -437,8 +475,9 @@ def ubicar_lugar(nombre: str, departamento: str = "") -> dict[str, Any]:
     filtros = ["busqueda LIKE ?"]
     params: list[Any] = [f"%{sin_tildes(nombre)}%"]
     if departamento:
-        filtros.append("strip_accents(upper(departamento)) LIKE ?")
-        params.append(f"%{sin_tildes(departamento)}%")
+        cond, par = filtro_departamento(departamento)
+        filtros.append(cond)
+        params.append(par)
 
     df = conexion().execute(f"""
         SELECT lugar, tipo, cod_municipio, municipio, departamento, lat, lon, homonimos
@@ -945,9 +984,9 @@ def buscar_colegio(nombre: str, departamento: str, municipio: str = "") -> dict[
     if not departamento:
         return FALTA_AMBITO
 
-    filtros = ["strip_accents(upper(nombre_sede)) LIKE ?",
-               "strip_accents(upper(departamento)) LIKE ?"]
-    params: list[Any] = [f"%{sin_tildes(nombre)}%", f"%{sin_tildes(departamento)}%"]
+    cond_dep, par_dep = filtro_departamento(departamento)
+    filtros = ["strip_accents(upper(nombre_sede)) LIKE ?", cond_dep]
+    params: list[Any] = [f"%{sin_tildes(nombre)}%", par_dep]
     if municipio:
         filtros.append("strip_accents(upper(municipio)) LIKE ?")
         params.append(f"%{sin_tildes(municipio)}%")
@@ -1059,8 +1098,9 @@ def senales_departamento(departamento: str, senal: str = "") -> dict[str, Any]:
     if not departamento:
         return FALTA_AMBITO
 
-    filtros = ["strip_accents(upper(departamento)) LIKE ?", "n_senales > 0"]
-    params: list[Any] = [f"%{sin_tildes(departamento)}%"]
+    cond_dep, par_dep = filtro_departamento(departamento)
+    filtros = [cond_dep, "n_senales > 0"]
+    params: list[Any] = [par_dep]
     if senal:
         filtros.append("list_contains(senales, ?)")
         params.append(senal)
