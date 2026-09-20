@@ -65,6 +65,7 @@ import logging
 import os
 import secrets
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 LOG = logging.getLogger("brujula.orquestador")
@@ -158,43 +159,71 @@ class Herramientas:
     """
     Envoltorio del servidor MCP.
 
-    Se conecta una vez y mantiene la sesión. El servidor lee parquet desde
-    disco, así que las llamadas son de milisegundos y no vale la pena abrir y
-    cerrar una sesión por pregunta.
+    Abre una sesión por consulta y la cierra al terminar.
+
+    La versión anterior abría UNA sesión al arrancar y la guardaba para
+    siempre. Parecía lo eficiente —el servidor lee parquet de disco, las
+    llamadas son de milisegundos— y funcionó en todas las pruebas locales.
+    En producción fallaba todas las consultas.
+
+    El motivo: por debajo, sse_client levanta un grupo de tareas de anyio, y
+    esos grupos pertenecen a la tarea que los creó. La sesión nacía en el
+    arranque de la aplicación y se usaba después desde las tareas que atienden
+    cada petición, que son otras. El catálogo de herramientas —que se pide en
+    el mismo arranque, en la misma tarea— llegaba perfecto, así que /salud
+    informaba «13 herramientas, consultas abiertas» mientras toda llamada real
+    moría. Un diagnóstico que se ve sano y no lo está es la peor forma de
+    fallar, y es justo lo que Brújula existe para no hacer.
+
+    Abrir y cerrar por consulta cuesta una fracción de segundo frente a los
+    segundos que tarda el modelo, y de paso arregla algo que costaba caro: el
+    servidor MCP se puede reiniciar sin dejar al orquestador hablándole a una
+    sesión muerta hasta que alguien lo reinicie a mano.
     """
 
     def __init__(self, url: str = MCP_URL) -> None:
         self.url = url
-        self._sesion = None
         self._catalogo: list[dict[str, Any]] = []
 
-    async def abrir(self) -> None:
+    @asynccontextmanager
+    async def sesion(self):
+        """Una sesión MCP viva mientras dure el bloque. Se abre y se cierra
+        dentro de la misma tarea, que es la única forma en que anyio lo
+        permite."""
         from mcp import ClientSession
         from mcp.client.sse import sse_client
 
-        self._ctx = sse_client(self.url)
-        lectura, escritura = await self._ctx.__aenter__()
-        self._ses_ctx = ClientSession(lectura, escritura)
-        self._sesion = await self._ses_ctx.__aenter__()
-        await self._sesion.initialize()
-        listado = await self._sesion.list_tools()
-        self._catalogo = [_esquema_a_openai(h) for h in listado.tools]
-        LOG.info("MCP conectado: %s herramientas", len(self._catalogo))
+        async with sse_client(self.url) as (lectura, escritura):
+            async with ClientSession(lectura, escritura) as ses:
+                await ses.initialize()
+                yield ses
+
+    async def abrir(self) -> None:
+        """Pide el catálogo. No deja nada abierto."""
+        async with self.sesion() as ses:
+            listado = await ses.list_tools()
+            self._catalogo = [_esquema_a_openai(h) for h in listado.tools]
+        LOG.info("MCP responde: %s herramientas", len(self._catalogo))
+
+    async def reintentar(self) -> bool:
+        """Vuelve a pedir el catálogo si quedó vacío porque el MCP no estaba.
+        Así el orquestador se recupera solo cuando el otro vuelve."""
+        if self._catalogo:
+            return True
+        try:
+            await self.abrir()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("El servidor MCP sigue sin responder: %s", exc)
+        return bool(self._catalogo)
 
     async def cerrar(self) -> None:
-        for ctx in ("_ses_ctx", "_ctx"):
-            objeto = getattr(self, ctx, None)
-            if objeto is not None:
-                try:
-                    await objeto.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    pass
+        return None
 
     @property
     def catalogo(self) -> list[dict[str, Any]]:
         return self._catalogo
 
-    async def llamar(self, nombre: str, argumentos: dict[str, Any],
+    async def llamar(self, sesion, nombre: str, argumentos: dict[str, Any],
                      acceso_completo: bool) -> dict[str, Any]:
         """
         Ejecuta una herramienta. Aquí se aplica la única regla de acceso que el
@@ -210,8 +239,20 @@ class Herramientas:
             # El token lo pone el orquestador, no el modelo.
             argumentos = {**argumentos, "token": TOKEN_NACIONAL}
 
-        resultado = await self._sesion.call_tool(nombre, argumentos)
+        try:
+            resultado = await sesion.call_tool(nombre, argumentos)
+        except Exception as exc:  # noqa: BLE001
+            # Sin este registro, un fallo de herramienta llega al modelo como
+            # un texto suelto, el modelo lo cuenta a su manera y en los logs no
+            # queda nada. Se pierde una tarde averiguando qué pasó.
+            LOG.exception("La herramienta %s falló con %s", nombre, argumentos)
+            return {"encontrado": False,
+                    "motivo": f"La herramienta {nombre} no pudo ejecutarse."}
+
         textos = [c.text for c in resultado.content if getattr(c, "text", None)]
+        if getattr(resultado, "isError", False):
+            LOG.error("La herramienta %s devolvió error con %s: %s",
+                      nombre, argumentos, (textos[0] if textos else "")[:400])
         if not textos:
             return {"encontrado": False, "motivo": "La herramienta no devolvió nada."}
         try:
@@ -281,73 +322,77 @@ async def responder(pregunta: str, departamento: str, municipio: str,
     cortes: set[str] = set()
     entrada = salida = 0
 
-    for vuelta in range(MAX_VUELTAS):
-        # `temperature` se manda solo si el modelo la acepta. Los modelos
-        # Claude en Foundry NO admiten `temperature` ni `top_k`, y mandarla
-        # hace fallar la llamada entera. Como la elección de modelo es una
-        # variable de entorno, el código tiene que aguantar las dos familias
-        # sin que nadie recuerde editarlo el día del cambio.
-        extra = {} if _SIN_TEMPERATURA else {"temperature": 0}
-        respuesta = modelo.chat.completions.create(
-            model=MODELO,
-            messages=mensajes,
-            tools=herramientas.catalogo,
-            **extra,
-        )
-        uso = getattr(respuesta, "usage", None)
-        if uso:
-            entrada += uso.prompt_tokens or 0
-            salida += uso.completion_tokens or 0
-
-        eleccion = respuesta.choices[0].message
-        if not eleccion.tool_calls:
-            return {
-                "respuesta": eleccion.content or "",
-                "vis": vis,
-                "advertencias": sorted(set(advertencias)),
-                "corte": sorted(cortes)[-1] if cortes else None,
-                "tokens_entrada": entrada,
-                "tokens_salida": salida,
-                "vueltas": vuelta + 1,
-            }
-
-        mensajes.append(eleccion.model_dump(exclude_none=True))
-        for llamada in eleccion.tool_calls:
-            try:
-                argumentos = json.loads(llamada.function.arguments or "{}")
-            except json.JSONDecodeError:
-                argumentos = {}
-            datos = await herramientas.llamar(
-                llamada.function.name, argumentos, acceso_completo
+    # Una sola sesión MCP para toda la consulta: se abre aquí y se cierra
+    # al salir, en esta misma tarea. Es la condición que anyio impone y que
+    # la versión anterior rompía sin que nada lo dijera.
+    async with herramientas.sesion() as sesion:
+        for vuelta in range(MAX_VUELTAS):
+            # `temperature` se manda solo si el modelo la acepta. Los modelos
+            # Claude en Foundry NO admiten `temperature` ni `top_k`, y mandarla
+            # hace fallar la llamada entera. Como la elección de modelo es una
+            # variable de entorno, el código tiene que aguantar las dos familias
+            # sin que nadie recuerde editarlo el día del cambio.
+            extra = {} if _SIN_TEMPERATURA else {"temperature": 0}
+            respuesta = modelo.chat.completions.create(
+                model=MODELO,
+                messages=mensajes,
+                tools=herramientas.catalogo,
+                **extra,
             )
+            uso = getattr(respuesta, "usage", None)
+            if uso:
+                entrada += uso.prompt_tokens or 0
+                salida += uso.completion_tokens or 0
 
-            # Las visualizaciones y las salvedades se recogen aquí, no se le
-            # piden al modelo: así llegan aunque el modelo las ignore.
-            bloque = datos.get("vis")
-            if isinstance(bloque, dict):
-                vis.append(bloque)
-            elif isinstance(bloque, list):
-                vis.extend(b for b in bloque if isinstance(b, dict))
-            advertencias.extend(a for a in datos.get("advertencias", []) if a)
-            if datos.get("corte"):
-                cortes.add(str(datos["corte"]))
+            eleccion = respuesta.choices[0].message
+            if not eleccion.tool_calls:
+                return {
+                    "respuesta": eleccion.content or "",
+                    "vis": vis,
+                    "advertencias": sorted(set(advertencias)),
+                    "corte": sorted(cortes)[-1] if cortes else None,
+                    "tokens_entrada": entrada,
+                    "tokens_salida": salida,
+                    "vueltas": vuelta + 1,
+                }
 
-            mensajes.append({
-                "role": "tool",
-                "tool_call_id": llamada.id,
-                "content": json.dumps(datos, ensure_ascii=False)[:60_000],
-            })
+            mensajes.append(eleccion.model_dump(exclude_none=True))
+            for llamada in eleccion.tool_calls:
+                try:
+                    argumentos = json.loads(llamada.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    argumentos = {}
+                datos = await herramientas.llamar(
+                    sesion, llamada.function.name, argumentos, acceso_completo
+                )
 
-    return {
-        "respuesta": "La consulta se enredó y se cortó para no seguir gastando. "
-                     "Prueba con una pregunta más concreta.",
-        "vis": vis,
-        "advertencias": sorted(set(advertencias)),
-        "corte": sorted(cortes)[-1] if cortes else None,
-        "tokens_entrada": entrada,
-        "tokens_salida": salida,
-        "vueltas": MAX_VUELTAS,
-    }
+                # Las visualizaciones y las salvedades se recogen aquí, no se le
+                # piden al modelo: así llegan aunque el modelo las ignore.
+                bloque = datos.get("vis")
+                if isinstance(bloque, dict):
+                    vis.append(bloque)
+                elif isinstance(bloque, list):
+                    vis.extend(b for b in bloque if isinstance(b, dict))
+                advertencias.extend(a for a in datos.get("advertencias", []) if a)
+                if datos.get("corte"):
+                    cortes.add(str(datos["corte"]))
+
+                mensajes.append({
+                    "role": "tool",
+                    "tool_call_id": llamada.id,
+                    "content": json.dumps(datos, ensure_ascii=False)[:60_000],
+                })
+
+        return {
+            "respuesta": "La consulta se enredó y se cortó para no seguir gastando. "
+                         "Prueba con una pregunta más concreta.",
+            "vis": vis,
+            "advertencias": sorted(set(advertencias)),
+            "corte": sorted(cortes)[-1] if cortes else None,
+            "tokens_entrada": entrada,
+            "tokens_salida": salida,
+            "vueltas": MAX_VUELTAS,
+        }
 
 
 # --------------------------------------------------------------------- #
@@ -453,7 +498,6 @@ def _ip_del_cliente(peticion: Any) -> str:
 
 
 def crear_app():
-    from contextlib import asynccontextmanager
 
     from fastapi import FastAPI, Request
     from fastapi.middleware.cors import CORSMiddleware
@@ -561,6 +605,11 @@ def crear_app():
 
     @app.post("/preguntar")
     async def preguntar(consulta: Consulta, peticion: Request) -> JSONResponse:
+        # Si el catálogo quedó vacío porque el MCP no estaba en pie cuando
+        # arrancamos, se reintenta aquí en vez de exigir un reinicio a mano.
+        if not estado["herramientas"].catalogo:
+            await estado["herramientas"].reintentar()
+
         if not estado["herramientas"].catalogo or not estado.get("modelo"):
             return JSONResponse(
                 {"motivo": "Todavía no hay un corte de datos publicado. El "
