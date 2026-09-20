@@ -41,7 +41,10 @@
     },
     "urlMcp": {
       "type": "string",
-      "defaultValue": "https://brujula-mcp.ambitiousplant-035eb04f.eastus2.azurecontainerapps.io/sse"
+      "defaultValue": "https://brujula-mcp.internal.ambitiousplant-035eb04f.eastus2.azurecontainerapps.io/sse",
+      "metadata": {
+        "description": "Dirección del servidor MCP. Lleva «.internal.» porque el MCP tiene ingreso interno: solo las apps del mismo entorno lo alcanzan. Si algún día se recrea el entorno, cambia el sufijo aleatorio y hay que actualizar esto (y BRUJULA_MCP_ANFITRIONES en el MCP)."
+      }
     },
     "origenes": {
       "type": "string",

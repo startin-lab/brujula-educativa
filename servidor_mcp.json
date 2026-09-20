@@ -103,7 +103,7 @@
         "configuration": {
           "activeRevisionsMode": "Single",
           "ingress": {
-            "external": true,
+            "external": false,
             "targetPort": 8080,
             "transport": "auto",
             "allowInsecure": false,
@@ -112,7 +112,8 @@
                 "latestRevision": true,
                 "weight": 100
               }
-            ]
+            ],
+            "_nota_ingreso": "Interno a propósito. Este servidor no tiene portero: quien le hable directo se salta los cupos y el presupuesto. Solo el orquestador, en el mismo entorno, debe poder verlo. Desde afuera el proxy de Azure responde 404."
           }
         },
         "template": {
