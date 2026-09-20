@@ -84,6 +84,26 @@ def colegios_del_municipio(municipio: str, departamento: str = "", orden: str = 
 
 
 @mcp.tool()
+def ficha_departamento(departamento: str, indicador: str = "cobertura_neta") -> str:
+    """El departamento como un todo."""
+    return json.dumps({"encontrado": True, "departamento": departamento, "municipios": 2,
+        "poblacion": {"habitantes": 3200000}, "indicador": {"clave": indicador},
+        "municipios_detalle": [{"municipio": "Soacha", "lat": 4.58, "lon": -74.22, "valor": 83.3}],
+        "corte": "2026-09-20", "advertencias": ["Agregado ponderado."],
+        "vis": [{"tipo": "cifras", "titulo": departamento, "cifras": [], "advertencias": []}]}, ensure_ascii=False)
+
+
+@mcp.tool()
+def ficha_pais(indicador: str = "cobertura_neta") -> str:
+    """Colombia entera."""
+    return json.dumps({"encontrado": True, "ambito": "Colombia", "departamentos": 2, "municipios": 3,
+        "poblacion": {"habitantes": 53000000}, "indicador": {"clave": indicador},
+        "departamentos_detalle": [{"cod_departamento": "25", "departamento": "CUNDINAMARCA", "valor": 83.3}],
+        "corte": "2026-09-20", "advertencias": ["Comparar departamentos es orientativo."],
+        "vis": [{"tipo": "cifras", "titulo": "Colombia", "cifras": [], "advertencias": []}]}, ensure_ascii=False)
+
+
+@mcp.tool()
 def ficha_municipio(departamento: str, municipio: str) -> str:
     """Ficha de un municipio."""
     return json.dumps({
@@ -122,17 +142,26 @@ class ModeloSimulado:
     def __init__(self):
         self.chat = types.SimpleNamespace(completions=self)
         self.visto: list[list[dict]] = []
+        self.ultima_herramienta = ""
 
     def create(self, **kw):
         self.visto.append(kw.get("messages", []))
-        ya_llamo = any(m.get("role") == "tool" for m in kw.get("messages", []))
+        mensajes = kw.get("messages", [])
+        ya_llamo = any(m.get("role") == "tool" for m in mensajes)
+        # Lee el ámbito que le manda el orquestador, como haría el modelo real.
+        ambito = next((m["content"] for m in mensajes if m.get("role") == "system"
+                       and str(m.get("content", "")).startswith("Ámbito")), "")
         if not ya_llamo:
+            if "país entero" in ambito:
+                nombre, args = "ficha_pais", {}
+            elif "DEPARTAMENTO como un todo" in ambito:
+                nombre, args = "ficha_departamento", {"departamento": "CUNDINAMARCA"}
+            else:
+                nombre, args = "ficha_municipio", {"departamento": "CUNDINAMARCA", "municipio": "Soacha"}
+            self.ultima_herramienta = nombre
             llamada = types.SimpleNamespace(
                 id="c1", type="function",
-                function=types.SimpleNamespace(
-                    name="ficha_municipio",
-                    arguments=json.dumps({"departamento": "CUNDINAMARCA",
-                                          "municipio": "Soacha"})))
+                function=types.SimpleNamespace(name=nombre, arguments=json.dumps(args)))
             msg = _mensaje(None, [llamada])
         else:
             msg = _mensaje("La cobertura neta de Soacha es 91,2%.", None)
@@ -197,7 +226,7 @@ def _comprobar() -> int:
     with TestClient(orquestador.crear_app()) as cliente:
         print("\n== 1. El orquestador ve el catálogo del MCP ==")
         salud = cliente.get("/salud").json()
-        ok(salud["herramientas"] == 4, "el catálogo llegó completo")
+        ok(salud["herramientas"] == 6, "el catálogo llegó completo")
         ok(salud["consultas"] == "abiertas", "las consultas quedan abiertas")
 
         print("\n== 2. Una pregunta cruza entera ==")
@@ -253,6 +282,27 @@ def _comprobar() -> int:
         r6 = cliente.post("/preguntar", json={"pregunta": "¿cómo le va?", "departamento": "CUNDINAMARCA",
             "municipio": "Soacha", "sede": "IE Alfa", "cod_sede": "1", "visitante": "visitante-3"})
         ok(r6.json().get("desde_cache") is True, "y repetirla sobre la misma sede sí")
+
+        print("\n== 4c. Ámbito departamento y país ==")
+        rd = cliente.post("/preguntar", json={"pregunta": "¿cómo está el departamento?", "departamento": "CUNDINAMARCA",
+                                              "municipio": "", "visitante": "visitante-4"})
+        ok(rd.status_code == 200 and modelo.ultima_herramienta == "ficha_departamento",
+           f"con solo departamento, el modelo recibe ese ámbito y usa ficha_departamento ({rd.status_code})")
+        ok(rd.json().get("vis") and rd.json()["vis"][0]["titulo"] == "CUNDINAMARCA", "y la visualización departamental llega")
+        rp = cliente.post("/preguntar", json={"pregunta": "¿cómo está el país?", "departamento": "", "municipio": "",
+                                              "visitante": "visitante-4"})
+        ok(rp.status_code == 200 and modelo.ultima_herramienta == "ficha_pais",
+           f"sin territorio, el ámbito es el país y usa ficha_pais ({rp.status_code})")
+        ok(rp.json().get("desde_cache") is False, "la pregunta de país no sale de la caché de la departamental")
+        d1 = cliente.get("/departamento", params={"departamento": "CUNDINAMARCA"})
+        ok(d1.status_code == 200 and d1.json()["municipios_detalle"][0]["municipio"] == "Soacha",
+           "/departamento trae los municipios para el mapa sin gastar cupo")
+        ok(cliente.get("/departamento").status_code == 400, "/departamento sin nombre es 400")
+        p1 = cliente.get("/pais", params={"indicador": "desercion"})
+        ok(p1.status_code == 200 and p1.json()["indicador"]["clave"] == "desercion",
+           "/pais responde y respeta el indicador pedido")
+        ok(cliente.get("/estado", params={"v": "visitante-4"}).json().get("restantes") == 8,
+           "las dos preguntas gastaron cupo; las lecturas no")
 
         print("\n== 5. El registro sigue vivo aunque no haya modelo ==")
         r3 = cliente.post("/registrar", json={

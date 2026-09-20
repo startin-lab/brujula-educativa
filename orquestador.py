@@ -128,9 +128,16 @@ educación en Colombia usando únicamente datos abiertos oficiales.
 
 CÓMO TRABAJAS
 
-- Todo diagnóstico es territorial. Nunca respondas «sobre el país» salvo que
-  te lo pidan con acceso completo. Si no sabes de qué municipio o departamento
-  hablan, pregúntalo antes de consultar.
+- Todo diagnóstico tiene un ámbito, y el ámbito lo fija el usuario en la página:
+  municipio (con o sin colegio), departamento o el país entero. Respeta el que
+  venga en «Ámbito de esta consulta»: con municipio usa ficha_municipio y las
+  herramientas municipales; con solo departamento usa ficha_departamento y
+  senales_departamento; sin territorio usa ficha_pais y ranking_nacional.
+  Si el ámbito es municipal y no sabes cuál, pregúntalo antes de consultar.
+- Cuanto más amplio el ámbito, más cuidado: un agregado nacional o departamental
+  mezcla contextos muy distintos. Al hablar del país o del departamento, señala
+  siempre dónde bajar a mirar (qué departamentos o municipios) en vez de dar un
+  veredicto general.
 - Usa las herramientas SIEMPRE, incluso si crees saber la respuesta. Ninguna
   cifra sale de tu memoria: toda cifra viene de una herramienta de esta sesión.
   No inventes, no estimes, no redondees de cabeza. Si una herramienta no trae un dato,
@@ -362,7 +369,12 @@ async def responder(pregunta: str, departamento: str, municipio: str,
         ambito.append(f"Sede elegida: {sede}" + (f" (código DANE {cod_sede})" if cod_sede else "")
                       + ". Responde sobre esta sede con ficha_colegio; el municipio y el "
                         "departamento son su referencia de comparación.")
-    contexto = " · ".join(ambito) if ambito else "Sin territorio elegido todavía."
+    if departamento and not municipio:
+        ambito.append("Sin municipio: la pregunta es sobre el DEPARTAMENTO como un todo. "
+                      "Usa ficha_departamento y senales_departamento.")
+    contexto = (" · ".join(ambito) if ambito else
+                "Colombia, país entero: no hay territorio elegido. Usa ficha_pais y "
+                "ranking_nacional, y orienta hacia los departamentos donde conviene mirar.")
 
     mensajes = [
         {"role": "system", "content": INSTRUCCIONES},
@@ -799,6 +811,42 @@ def crear_app():
             fichas[clave] = {"datos": datos, "cuando": time.time()}
         return JSONResponse(datos, status_code=200 if datos.get("encontrado") else 404,
                             headers={"cache-control": "public, max-age=1800"})
+
+    async def _lectura(clave: str, herramienta: str, argumentos: dict, ttl: int = 6 * 3600) -> JSONResponse:
+        """Una herramienta de solo lectura, cacheada en memoria, sin modelo ni cupo."""
+        lecturas = estado.setdefault("lecturas", {})
+        guardada = lecturas.get(clave)
+        if guardada and time.time() - guardada["cuando"] < ttl:
+            return JSONResponse(guardada["datos"], headers={"cache-control": "public, max-age=1800"})
+        if not estado["herramientas"].catalogo:
+            await estado["herramientas"].reintentar()
+        try:
+            datos = await estado["herramientas"].una(herramienta, argumentos)
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo leer %s %s", herramienta, argumentos)
+            return JSONResponse({"motivo": "El servidor de datos no respondió."}, status_code=503)
+        if datos.get("encontrado"):
+            if len(lecturas) > 500:
+                lecturas.clear()
+            lecturas[clave] = {"datos": datos, "cuando": time.time()}
+        return JSONResponse(datos, status_code=200 if datos.get("encontrado") else 404,
+                            headers={"cache-control": "public, max-age=1800"})
+
+    @app.get("/departamento")
+    async def departamento_(departamento: str = "", indicador: str = "cobertura_neta"):
+        """El departamento como un todo, para la vista que aparece antes de elegir municipio."""
+        dep = departamento.strip()
+        if not dep:
+            return JSONResponse({"motivo": "Falta el departamento."}, status_code=400)
+        ind = indicador.strip() or "cobertura_neta"
+        return await _lectura(f"depto|{dep.casefold()}|{ind}", "ficha_departamento",
+                              {"departamento": dep, "indicador": ind})
+
+    @app.get("/pais")
+    async def pais(indicador: str = "cobertura_neta"):
+        """Colombia entera, para la portada del agente: totales y un valor por departamento."""
+        ind = indicador.strip() or "cobertura_neta"
+        return await _lectura(f"pais|{ind}", "ficha_pais", {"indicador": ind})
 
     @app.get("/colegios")
     async def colegios(departamento: str = "", municipio: str = ""):

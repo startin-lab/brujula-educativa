@@ -214,6 +214,21 @@ def generar(destino: Path) -> None:
     ])
     eco["cod_departamento"] = eco["cod_departamento"].astype("string")
     eco.to_parquet(destino / "economia_resumen.parquet", index=False)
+    # El PIB crudo, con sus trece actividades y dos años: de aquí salen las
+    # cinco principales en la ficha (el resumen precalculado solo guarda tres).
+    actividades = ["Industrias manufactureras", "Comercio y transporte", "Construcción",
+                   "Agricultura, ganadería, caza, silvicultura y pesca", "Administración pública y defensa",
+                   "Actividades financieras", "Explotación de minas", "Información y comunicaciones",
+                   "Actividades inmobiliarias", "Actividades profesionales", "Suministro de electricidad",
+                   "Actividades artísticas", "Educación privada"]
+    pib = pd.DataFrame([
+        dict(cod_departamento=cd, departamento=dep.title(), anio=anio, actividad=a,
+             sector="Secundario" if i < 3 else "Terciario", valor_miles_millones=float(1000 * (13 - i) + anio - 2020))
+        for cd, dep in (("05", "ANTIOQUIA"), ("25", "CUNDINAMARCA")) for anio in (2022, 2023)
+        for i, a in enumerate(actividades)
+    ])
+    pib["cod_departamento"] = pib["cod_departamento"].astype("string")
+    pib.to_parquet(destino / "economia_departamental.parquet", index=False)
 
     detalle = pd.DataFrame([
         dict(objeto_a_contratar=f"PRESTACION DE SERVICIOS EDUCATIVOS {k}",
@@ -392,6 +407,13 @@ def main() -> int:
               llamar(S.ficha_municipio, municipio="Macondo", departamento="ANTIOQUIA")["encontrado"] is False)
 
         print("\n== 3a. Habitantes, matrícula y docentes en la ficha ==")
+        eco = f.get("economia_del_departamento") or {}
+        check("la economía trae cinco actividades del PIB crudo, último año",
+              len(eco.get("actividades_principales", [])) == 5 and eco.get("anio") == 2023, eco)
+        check("ordenadas de mayor a menor peso",
+              [a["pct_del_pib"] for a in eco["actividades_principales"]] == sorted((a["pct_del_pib"] for a in eco["actividades_principales"]), reverse=True))
+        check("y la cifra de estudiantes por computador con su año",
+              any(c["etiqueta"].startswith("Estudiantes por computador · CPE 20") for c in f["vis"][0]["cifras"]))
         pobl = f.get("poblacion") or {}
         check("la ficha trae habitantes del año en curso",
               pobl.get("habitantes") and pobl.get("anio") == date.today().year, pobl)
@@ -422,6 +444,44 @@ def main() -> int:
         check("un municipio sin proyección DANE sigue teniendo ficha, sin habitantes",
               f7["encontrado"] and f7["poblacion"] is None
               and not any(c["etiqueta"].startswith("Habitantes") for c in f7["vis"][0]["cifras"]))
+
+        print("\n== 3c. Departamento y país agregados ==")
+        fm = pd.read_parquet(datos / "fichas_municipio.parquet")
+        fd = llamar(S.ficha_departamento, departamento="ANTIOQUIA")
+        check("la ficha departamental responde", fd["encontrado"] is True, fd.get("mensaje"))
+        check("cuenta sus 20 municipios", fd["municipios"] == 20, fd.get("municipios"))
+        suma_pob = int(fm[fm.departamento == "ANTIOQUIA"]["poblacion_total"].sum())
+        check("los habitantes son la suma de los municipios", fd["poblacion"]["habitantes"] == suma_pob,
+              (fd["poblacion"]["habitantes"], suma_pob))
+        check("la matrícula también", fd["matricula"]["estudiantes"] == int(fm[fm.departamento == "ANTIOQUIA"]["matricula_total"].sum()))
+        check("los docentes suman la ETC departamental y la de Muni3, una vez cada una",
+              fd["docentes"]["docentes_oficiales"] == 19451 + 840 and fd["docentes"]["entidades_certificadas"] == 2, fd["docentes"])
+        cob = fd["indicadores"]["cobertura_neta"]
+        check("la cobertura ponderada cae dentro del rango de sus municipios",
+              cob is not None and fm[fm.departamento == "ANTIOQUIA"]["cobertura_neta"].min() <= cob <= fm[fm.departamento == "ANTIOQUIA"]["cobertura_neta"].max(), cob)
+        check("cada municipio viene con coordenadas y valor para el mapa",
+              len(fd["municipios_detalle"]) == 20 and all(m["lat"] is not None for m in fd["municipios_detalle"]))
+        check("la prioridad va de peor a mejor cobertura",
+              [x["valor"] for x in fd["prioridad"]] == sorted(x["valor"] for x in fd["prioridad"]))
+        fd2 = llamar(S.ficha_departamento, departamento="ANTIOQUIA", indicador="desercion")
+        check("con deserción, peor primero es el mayor",
+              [x["valor"] for x in fd2["prioridad"]] == sorted((x["valor"] for x in fd2["prioridad"]), reverse=True))
+        check("un indicador inventado se rechaza", llamar(S.ficha_departamento, departamento="ANTIOQUIA", indicador="pib")["encontrado"] is False)
+        check("dos bloques de visualización: cifras y tabla", [v["tipo"] for v in fd["vis"]] == ["cifras", "tabla"])
+        check("el departamento trae su economía (cinco actividades) y estudiantes por computador",
+              len((fd.get("economia") or {}).get("actividades_principales", [])) == 5
+              and fd["equipos"]["estudiantes_por_computador"] is not None, fd.get("equipos"))
+
+        fp_ = llamar(S.ficha_pais)
+        check("la ficha país responde con 2 departamentos y 40 municipios",
+              fp_["encontrado"] and fp_["departamentos"] == 2 and fp_["municipios"] == 40)
+        check("los habitantes del país son la suma de todos", fp_["poblacion"]["habitantes"] == int(fm["poblacion_total"].sum()))
+        check("una fila por departamento para el mapa, con su código",
+              len(fp_["departamentos_detalle"]) == 2 and {x["cod_departamento"] for x in fp_["departamentos_detalle"]} == {"05", "25"})
+        check("docentes nacionales: tres ETC una vez cada una", fp_["docentes"]["docentes_oficiales"] == 19451 + 11031 + 840)
+        check("advierte que comparar departamentos es orientativo", any("orientativ" in a for a in fp_["advertencias"]))
+        rk = llamar(S.ranking_nacional, indicador="desercion", limite=5)
+        check("el ranking nacional ya no exige token", rk["encontrado"] is True and len(rk["municipios"]) == 5)
 
         print("\n== 3b. Un código sin cero a la izquierda no parte el municipio ==")
         fm = pd.read_parquet(datos / "fichas_municipio.parquet")
@@ -508,17 +568,16 @@ def main() -> int:
               all(a["valor_cop"] >= b["valor_cop"] for a, b in zip(k["mayores"], k["mayores"][1:])))
         check("el aviso de SECOP viaja pegado", any("no dónde se ejecutó" in a for a in k["advertencias"]))
 
-        print("\n== 10. Consulta nacional: cerrada sin token ==")
-        check("sin token, no responde",
-              llamar(S.ranking_nacional, indicador="desercion", token="").get("requiere_acceso_completo") is True)
-        check("token equivocado tampoco",
-              llamar(S.ranking_nacional, indicador="desercion", token="adivinado").get("requiere_acceso_completo") is True)
-        check("con el token correcto sí",
-              llamar(S.ranking_nacional, indicador="desercion", token="token-de-prueba")["encontrado"])
-        S._token_nacional = ""
-        check("sin token configurado queda cerrada para todos",
-              llamar(S.ranking_nacional, indicador="desercion", token="").get("requiere_acceso_completo") is True)
-        S._token_nacional = "token-de-prueba"
+        print("\n== 10. Consulta nacional: abierta, con sus advertencias ==")
+        # La fundación decidió el 20/09/2026 abrir el país a todo el mundo: a
+        # algunas organizaciones el panorama nacional les genera valor. El
+        # freno es el presupuesto mensual del portero, no un token.
+        rk = llamar(S.ranking_nacional, indicador="desercion", peores=True, limite=5)
+        check("responde sin token", rk["encontrado"] is True and len(rk["municipios"]) == 5)
+        check("peor primero: la deserción baja a lo largo de la lista",
+              [m["valor"] for m in rk["municipios"]] == sorted((m["valor"] for m in rk["municipios"]), reverse=True))
+        check("advierte que un ranking nacional mezcla contextos", any("mezcla contextos" in a for a in rk["advertencias"]))
+        check("un indicador no permitido se rechaza", llamar(S.ranking_nacional, indicador="pib")["encontrado"] is False)
 
         print("\n== 11. Transparencia ==")
         ed = llamar(S.estado_de_los_datos)
@@ -581,7 +640,7 @@ def main() -> int:
 
         print("\n== 14. Economía: del departamento, nunca del municipio ==")
         eco = f["economia_del_departamento"]
-        check("trae actividades principales", eco and len(eco["actividades_principales"]) == 3)
+        check("trae actividades principales (cinco, del PIB crudo)", eco and len(eco["actividades_principales"]) == 5)
         check("cada una con su peso en el PIB",
               all(a["pct_del_pib"] is not None for a in eco["actividades_principales"]))
         check("el ámbito dice explícitamente 'Departamento de'", eco["ambito"].startswith("Departamento de"))

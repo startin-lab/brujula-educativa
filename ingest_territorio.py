@@ -250,13 +250,16 @@ def bajar_pib() -> pd.DataFrame:
 
 
 def resumen_economico(pib: pd.DataFrame) -> pd.DataFrame:
-    """Las tres actividades principales de cada departamento en el último año."""
+    """Las cinco actividades principales de cada departamento en el último año.
+
+    El servidor ya calcula esto en vivo desde el PIB crudo cuando lo tiene; el
+    resumen queda como respaldo para un corte sin ese archivo."""
     ultimo = int(pib["anio"].max())
     reciente = pib[pib["anio"] == ultimo]
     filas = []
     for cod, g in reciente.groupby("cod_departamento"):
         total = g["valor_miles_millones"].sum()
-        top = g.nlargest(3, "valor_miles_millones")
+        top = g.nlargest(5, "valor_miles_millones")
         filas.append({
             "cod_departamento": cod,
             "departamento": g.iloc[0]["departamento"],

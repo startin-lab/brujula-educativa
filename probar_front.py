@@ -50,12 +50,44 @@ FICHA = {
     "docentes": {"anio": 2022, "entidad_territorial_certificada": "Tumaco", "la_etc_es_este_municipio": True,
                  "docentes_oficiales": 2310, "estudiantes_oficiales_por_docente": 22.7},
     "saber11": {"sedes_evaluadas": 51},
+    "brecha_digital": {"pct_internet": 43.0, "ninos_por_terminal": 6.2, "anio_ninos_por_terminal": 2019},
     "economia_del_departamento": {"ambito": "Departamento de Nariño", "anio": 2023,
         "actividades_principales": [
             {"actividad": "Administración pública y defensa; planes de seguridad social de afiliación obligatoria; educación; actividades de atención de la salud humana y de servicios sociales", "pct_del_pib": 27.0},
             {"actividad": "Agricultura, ganadería, caza, silvicultura y pesca", "pct_del_pib": 14.2}],
         "advertencia": "El PIB solo se publica por departamento."},
     "senales": [{"clave": "cobertura_neta_baja"}, {"clave": "brecha_digital_alta"}],
+}
+PAIS = {
+    "encontrado": True, "ambito": "Colombia", "departamentos": 33, "municipios": 1124, "municipios_con_senales": 781,
+    "corte": "2026-09-20",
+    "poblacion": {"anio": 2026, "habitantes": 53400000, "de_5_a_18": 11200000, "pct_de_5_a_18": 21.0},
+    "matricula": {"anio": 2025, "estudiantes": 9311478, "oficial": 7400000, "por_cada_100_de_5_a_18": 83.1},
+    "docentes": {"anio": 2022, "docentes_oficiales": 328745, "entidades_certificadas": 96},
+    "indicadores": {"anio": 2024, "cobertura_neta": 88.2, "desercion": 3.4},
+    "saber11": {"mediana_matematicas": 47.1, "pct_internet": 61.0},
+    "indicador": {"clave": "cobertura_neta", "etiqueta": "Cobertura neta", "unidad": "%", "mejor_alto": True},
+    "departamentos_detalle": [
+        {"cod_departamento": "25", "departamento": "CUNDINAMARCA", "municipios": 116, "municipios_con_senales": 60,
+         "habitantes": 3400000, "matricula": 600000, "valor": 91.0},
+        {"cod_departamento": "52", "departamento": "NARIÑO", "municipios": 64, "municipios_con_senales": 50,
+         "habitantes": 1600000, "matricula": 300000, "valor": 78.5},
+    ],
+}
+DEPARTAMENTO = {
+    "encontrado": True, "departamento": "NARIÑO", "cod_departamento": "52", "municipios": 64, "municipios_con_senales": 50,
+    "corte": "2026-09-20",
+    "poblacion": {"anio": 2026, "habitantes": 1600000, "de_5_a_18": 380000, "pct_de_5_a_18": 23.7},
+    "matricula": {"anio": 2025, "estudiantes": 300000, "oficial": 270000, "por_cada_100_de_5_a_18": 79.0},
+    "docentes": {"anio": 2022, "docentes_oficiales": 8764 + 2310, "entidades_certificadas": 3},
+    "indicadores": {"anio": 2024, "cobertura_neta": 78.5, "desercion": 4.1},
+    "saber11": {"mediana_matematicas": 45.0, "pct_internet": 40.0},
+    "indicador": {"clave": "cobertura_neta", "etiqueta": "Cobertura neta", "unidad": "%", "mejor_alto": True},
+    "municipios_detalle": [
+        {"municipio": "Pasto", "cod_municipio": "52001", "lat": 1.21, "lon": -77.28, "valor": 92.0, "senales": 1, "habitantes": 400000, "matricula": 90000},
+        {"municipio": "San Andres de Tumaco", "cod_municipio": "52835", "lat": 1.8, "lon": -78.8, "valor": 66.1, "senales": 2, "habitantes": 265312, "matricula": 58210},
+        {"municipio": "Sin coordenada", "cod_municipio": "52999", "lat": None, "lon": None, "valor": None, "senales": 0, "habitantes": None, "matricula": None},
+    ],
 }
 COLEGIOS = {"encontrado": True, "sedes": [
     {"cod": "152835000011", "nombre": "IE Ciudadela Tumac", "naturaleza": "OFICIAL", "zona": "URBANO", "evaluados": 120},
@@ -117,13 +149,17 @@ def main() -> int:
         # El servicio simulado responde a lo que la página pida.
         API = "https://acceso.brujula.startinlab.org"
         enviados: list[dict] = []
+        pedidos_pais: list[str] = []
         def ruta(route, request):
             url = request.url
             if url.startswith(f"{API}/preguntar"):
                 try: enviados.append(json.loads(request.post_data or "{}"))
                 except Exception: pass
             cuerpo = None
-            if url.startswith(f"{API}/territorios"): cuerpo = TERRITORIOS
+            if url.startswith(f"{API}/pais"):
+                pedidos_pais.append(url); cuerpo = PAIS
+            elif url.startswith(f"{API}/departamento"): cuerpo = DEPARTAMENTO
+            elif url.startswith(f"{API}/territorios"): cuerpo = TERRITORIOS
             elif url.startswith(f"{API}/estado"):    cuerpo = {"registrado": False, "restantes": 10}
             elif url.startswith(f"{API}/preguntar"): cuerpo = RESPUESTA
             elif url.startswith(f"{API}/ficha"):     cuerpo = FICHA
@@ -143,9 +179,51 @@ def main() -> int:
         print("\n== 2. Los desplegables se llenan con la lista del servicio ==")
         n = pagina.eval_on_selector("#sel-depto", "e => e.options.length - 1")
         ok(n == len(TERRITORIOS), f"departamentos: {n}")
-        ok(pagina.eval_on_selector("#sel-depto", "e => e.value") == "Cundinamarca",
-           "conserva el departamento preferido aunque cambie el formato del nombre")
-        ok(pagina.eval_on_selector("#sel-mun", "e => e.value") == "Soacha", "y el municipio")
+        ok(pagina.eval_on_selector("#sel-depto", "e => e.value") == "" and
+           pagina.inner_text("#chip-alcance").strip().lower() == "colombia",
+           "se aterriza en Colombia entera, sin territorio preseleccionado")
+        # Si alguien ya tenía departamento y municipio y llega la lista real,
+        # se conservan aunque cambie el formato del nombre.
+        pagina.evaluate("""() => { MUNICIPIOS_PRUEBA = 1; document.getElementById('sel-depto').value = 'Cundinamarca';
+            document.getElementById('sel-depto').onchange(); document.getElementById('sel-mun').value = 'Soacha';
+            document.getElementById('sel-mun').onchange(); }""")
+        pagina.wait_for_timeout(300)
+        ok(pagina.eval_on_selector("#sel-mun", "e => e.value") == "Soacha", "elegir municipio a mano funciona")
+
+        print("\n== 2b. Vista país: coropleta, cifras nacionales y bajada al departamento ==")
+        pagina.select_option("#sel-depto", "")
+        pagina.wait_for_selector("#inicio svg", timeout=5000)
+        inicio = pagina.inner_text("#inicio")
+        ok("Colombia" in inicio and "53.400.000" in inicio, "cifras nacionales con habitantes")
+        ok(pagina.eval_on_selector_all("#inicio svg path.dpto.coloreado", "e => e.length") == 2,
+           "los departamentos con dato van coloreados")
+        ok(pagina.eval_on_selector_all("#inicio svg path.dpto.sin-dato", "e => e.length") == 30,
+           "y los demás quedan como sin dato")
+        ok(pagina.eval_on_selector_all("#inicio .leyenda-mapa i", "e => e.length") == 5, "leyenda de cinco clases")
+        filas = pagina.eval_on_selector_all("#inicio .tabla-agregado tbody tr td:first-child", "els => els.map(e => e.textContent)")
+        ok(filas == ["Nariño", "Cundinamarca"], f"la tabla va de peor a mejor cobertura ({filas})")
+        ok("qué departamentos conviene mirar" in pagina.inner_text("#preguntas").lower(), "las preguntas sugeridas son de país")
+        pagina.select_option("#ind-mapa", "desercion")
+        pagina.wait_for_timeout(500)
+        ok(pedidos_pais and "indicador=desercion" in pedidos_pais[-1], "cambiar el indicador vuelve a pedir el país con ese indicador")
+        pagina.click("#inicio .tabla-agregado button[data-ir='NARIÑO']")
+        pagina.wait_for_selector("#inicio svg circle.pto", timeout=5000)
+        ok(pagina.eval_on_selector("#sel-depto", "e => e.value") == "Nariño", "clic en la tabla baja al departamento")
+
+        print("\n== 2c. Vista departamento: puntos coloreados y bajada al municipio ==")
+        inicio = pagina.inner_text("#inicio")
+        ok("Nariño" in inicio and "Departamento" in inicio and "64 municipios" in inicio, "encabezado departamental")
+        ok(pagina.eval_on_selector_all("#inicio svg circle.pto", "e => e.length") == 2, "un punto por municipio con coordenadas")
+        ok("qué municipios de este departamento habría que priorizar" in pagina.inner_text("#preguntas").lower(),
+           "las preguntas sugeridas son de departamento")
+        ok(pagina.inner_text("#chip-alcance").strip().lower() == "nariño", "el chip dice el departamento")
+        pagina.click("#inicio svg circle.pto[data-m='San Andres de Tumaco']")
+        pagina.wait_for_selector("#inicio .datos", timeout=5000)
+        pagina.wait_for_timeout(300)
+        ok(pagina.eval_on_selector("#sel-mun", "e => e.value") == "San Andres de Tumaco", "clic en un punto baja al municipio")
+        ok(not errores, "sin errores de JavaScript en las vistas país y departamento" + (f" → {errores[0][:90]}" if errores else ""))
+        pagina.select_option("#sel-depto", "Cundinamarca"); pagina.select_option("#sel-mun", "Soacha")
+        pagina.wait_for_timeout(300)
 
         print("\n== 3. El pie de «datos de muestra» solo sin servicio ==")
         ok(pagina.eval_on_selector("#aviso-muestra", "e => e.hidden") is True,
@@ -173,8 +251,12 @@ def main() -> int:
         ok("Agropecuario y pesca" in inicio and "Gobierno, educación y salud" in inicio,
            "de qué vive el departamento, con las ramas del DANE en nombre corto")
         ok("afiliación obligatoria" not in inicio, "sin la denominación completa de la CIIU en pantalla")
-        ok(pagina.eval_on_selector("#inicio .lista .fila b[title]", "e => e.title.includes('afiliación obligatoria')"),
+        ok(pagina.eval_on_selector("#inicio .tabla-eco td[title]", "e => e.title.includes('afiliación obligatoria')"),
            "pero la denominación exacta se conserva en el título")
+        ok(pagina.eval_on_selector_all("#inicio .tabla-eco tbody tr", "els => els.length") == 2 and
+           "27,0 %" in pagina.inner_text("#inicio .tabla-eco"),
+           "la economía va en tabla: actividad y % del PIB")
+        ok("6,2" in inicio and "Estudiantes por computador · CPE 2019" in inicio, "estudiantes por computador con su año de CPE")
         ok("2 señales" in inicio, "cuántas señales hay, sin decir cuáles todavía")
         ok(pagina.eval_on_selector_all("#inicio svg g.principal path.dpto", "e => e.length") == 32,
            "el mapa dibuja los 32 departamentos continentales")

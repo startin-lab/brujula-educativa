@@ -156,6 +156,11 @@ AVISO_DOCENTES = (
     "atribuir al municipio. No existe dato abierto de docentes por municipio ni por colegio."
 )
 
+AVISO_EQUIPOS = (
+    "«Estudiantes por computador» es el indicador de Computadores Para Educar (MinTIC) "
+    "en su último año reportado para el territorio; el programa dejó de actualizarse en "
+    "2023 y cuenta equipos entregados, no equipos en funcionamiento hoy."
+)
 AVISO_ECONOMIA = (
     "El PIB solo se publica por departamento. Es contexto regional, no una cifra "
     "de este municipio."
@@ -223,6 +228,8 @@ VISTAS = [
     ("secop_top", "secop_contratos_mayores.parquet"),
     ("lugares", "fichas_lugar.parquet"),
     ("geo_cp", "territorio_centros_poblados.parquet"),
+    ("cpe", "computadores_educar.parquet"),
+    ("pib", "economia_departamental.parquet"),
 ]
 
 
@@ -256,7 +263,130 @@ def conexion() -> duckdb.DuckDBPyConnection:
         meta = _datos / "fichas_metadatos.json"
         if meta.exists():
             _meta = json.loads(meta.read_text(encoding="utf-8"))
+        if _vista_lista(_con, "fichas_mun"):
+            try:
+                for sentencia in (SQL_FICHAS_DEPTO + ";" + SQL_FICHA_PAIS).split(";"):
+                    if sentencia.strip():
+                        _con.execute(sentencia)
+                LOG.info("Agregados por departamento y país listos")
+            except Exception as exc:  # noqa: BLE001
+                # Un corte viejo sin las columnas nuevas no debe tumbar el servidor:
+                # las herramientas de departamento y país dirán que no están.
+                LOG.warning("No se pudieron construir los agregados: %s", exc)
     return _con
+
+
+def _vista_lista(con: duckdb.DuckDBPyConnection, vista: str) -> bool:
+    try:
+        con.execute(f"SELECT 1 FROM {vista} LIMIT 1")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Los agregados se calculan AL ARRANCAR, sobre la ficha municipal, y no en la
+# ingesta: son 1.124 filas, tarda milisegundos, y así un corte ya publicado
+# gana la vista de departamento y país sin volver a correr una hora de ingesta.
+#
+# Las tasas se PONDERAN por población en edad escolar del MEN (la misma base
+# con que el Ministerio calcula la cobertura). El promedio simple de 116
+# municipios de Boyacá le daría a Tunja el mismo peso que a Busbanzá.
+SQL_FICHAS_DEPTO = """
+CREATE OR REPLACE TABLE fichas_depto_base AS
+WITH m AS (
+    SELECT *, COALESCE(poblacion_5_16, 0) AS peso FROM fichas_mun
+)
+SELECT
+    cod_departamento, departamento,
+    count(*)                                              AS municipios,
+    count(*) FILTER (WHERE n_senales > 0)                 AS municipios_con_senales,
+    sum(n_senales)                                        AS senales_total,
+    max(anio_men)                                         AS anio_men,
+    sum(poblacion_5_16)                                   AS poblacion_5_16,
+    -- Tasas ponderadas por población escolar, NULL si nadie del departamento reporta.
+    sum(cobertura_neta * peso) FILTER (WHERE cobertura_neta IS NOT NULL)
+      / NULLIF(sum(peso) FILTER (WHERE cobertura_neta IS NOT NULL), 0)   AS cobertura_neta,
+    sum(cobertura_bruta * peso) FILTER (WHERE cobertura_bruta IS NOT NULL)
+      / NULLIF(sum(peso) FILTER (WHERE cobertura_bruta IS NOT NULL), 0)  AS cobertura_bruta,
+    sum(desercion * peso) FILTER (WHERE desercion IS NOT NULL)
+      / NULLIF(sum(peso) FILTER (WHERE desercion IS NOT NULL), 0)        AS desercion,
+    count(*) FILTER (WHERE desercion IS NOT NULL)          AS municipios_con_desercion,
+    -- Saber 11: mediana de los municipios con dato, que es lo que ya se usa como referencia.
+    median(prom_matematicas)                               AS mediana_matematicas,
+    sum(evaluados)                                         AS evaluados,
+    sum(sedes_evaluadas)                                   AS sedes_evaluadas,
+    sum(evaluados * pct_internet / 100.0) FILTER (WHERE pct_internet IS NOT NULL)
+      / NULLIF(sum(evaluados) FILTER (WHERE pct_internet IS NOT NULL), 0) * 100 AS pct_internet,
+    -- Escala: población, matrícula y docentes.
+    max(anio_poblacion)                                    AS anio_poblacion,
+    sum(poblacion_total)                                   AS poblacion_total,
+    sum(poblacion_5_18_dane)                               AS poblacion_5_18,
+    max(anio_matricula)                                    AS anio_matricula,
+    sum(matricula_total)                                   AS matricula_total,
+    sum(matricula_oficial)                                 AS matricula_oficial,
+    sum(matricula_rural)                                   AS matricula_rural,
+    max(anio_docentes)                                     AS anio_docentes,
+    -- Estudiantes por computador: media de los municipios con dato, ponderada
+    -- por su población escolar, y el rango de años al que corresponde.
+    sum(ninos_por_terminal * peso) FILTER (WHERE ninos_por_terminal IS NOT NULL)
+      / NULLIF(sum(peso) FILTER (WHERE ninos_por_terminal IS NOT NULL), 0) AS ninos_por_terminal,
+    min(anio_ninos_por_terminal)                           AS anio_equipos_desde,
+    max(anio_ninos_por_terminal)                           AS anio_equipos_hasta,
+    count(*) FILTER (WHERE ninos_por_terminal IS NOT NULL) AS municipios_con_dato_equipos,
+    sum(n_contratos_educacion)                             AS n_contratos_educacion,
+    sum(valor_total_educacion)                             AS valor_total_educacion
+FROM m
+GROUP BY cod_departamento, departamento;
+
+-- Docentes: la ETC del departamento más las ETC de sus municipios certificados,
+-- cada una contada UNA vez (la fila del departamento se repite en cada municipio).
+CREATE OR REPLACE TABLE docentes_depto AS
+SELECT cod_departamento, sum(docentes) AS docentes_oficiales, count(*) AS etc_en_el_departamento
+FROM (SELECT DISTINCT cod_departamento, etc_docentes, docentes_oficiales AS docentes
+      FROM fichas_mun WHERE docentes_oficiales IS NOT NULL)
+GROUP BY cod_departamento;
+
+CREATE OR REPLACE TABLE fichas_depto AS
+SELECT f.*, d.docentes_oficiales, d.etc_en_el_departamento
+FROM fichas_depto_base f LEFT JOIN docentes_depto d USING (cod_departamento)
+"""
+
+SQL_FICHA_PAIS = """
+CREATE OR REPLACE VIEW fichas_mun_ext AS
+SELECT *, CASE WHEN poblacion_5_18_dane > 0 THEN matricula_total * 100.0 / poblacion_5_18_dane END
+              AS matricula_sobre_5_18
+FROM fichas_mun;
+
+CREATE OR REPLACE TABLE ficha_pais AS
+WITH m AS (SELECT *, COALESCE(poblacion_5_16, 0) AS peso FROM fichas_mun)
+SELECT
+    count(*)                                              AS municipios,
+    count(DISTINCT cod_departamento)                      AS departamentos,
+    count(*) FILTER (WHERE n_senales > 0)                 AS municipios_con_senales,
+    max(anio_men)                                         AS anio_men,
+    sum(poblacion_5_16)                                   AS poblacion_5_16,
+    sum(cobertura_neta * peso) FILTER (WHERE cobertura_neta IS NOT NULL)
+      / NULLIF(sum(peso) FILTER (WHERE cobertura_neta IS NOT NULL), 0)   AS cobertura_neta,
+    sum(desercion * peso) FILTER (WHERE desercion IS NOT NULL)
+      / NULLIF(sum(peso) FILTER (WHERE desercion IS NOT NULL), 0)        AS desercion,
+    median(prom_matematicas)                               AS mediana_matematicas,
+    sum(evaluados)                                         AS evaluados,
+    max(anio_poblacion)                                    AS anio_poblacion,
+    sum(poblacion_total)                                   AS poblacion_total,
+    sum(poblacion_5_18_dane)                               AS poblacion_5_18,
+    max(anio_matricula)                                    AS anio_matricula,
+    sum(matricula_total)                                   AS matricula_total,
+    sum(matricula_oficial)                                 AS matricula_oficial,
+    (SELECT sum(d) FROM (SELECT DISTINCT etc_docentes, docentes_oficiales AS d FROM m
+                          WHERE docentes_oficiales IS NOT NULL))          AS docentes_oficiales,
+    max(anio_docentes)                                     AS anio_docentes,
+    sum(ninos_por_terminal * peso) FILTER (WHERE ninos_por_terminal IS NOT NULL)
+      / NULLIF(sum(peso) FILTER (WHERE ninos_por_terminal IS NOT NULL), 0) AS ninos_por_terminal,
+    min(anio_ninos_por_terminal)                           AS anio_equipos_desde,
+    max(anio_ninos_por_terminal)                           AS anio_equipos_hasta,
+    count(*) FILTER (WHERE ninos_por_terminal IS NOT NULL) AS municipios_con_dato_equipos
+FROM m
+"""
 
 
 def existe(vista: str) -> bool:
@@ -371,9 +501,10 @@ FALTA_AMBITO = {
     "encontrado": False,
     "requiere_ambito": True,
     "mensaje": (
-        "Antes de consultar hay que elegir un territorio. Pregúntale al usuario por "
-        "el departamento y el municipio, o usa listar_departamentos y "
-        "listar_municipios para ofrecerle las opciones."
+        "Esta herramienta trabaja sobre un municipio y no recibió ninguno. Si el "
+        "usuario eligió solo el departamento, usa ficha_departamento o "
+        "senales_departamento; si no eligió nada, ficha_pais. Si quiere un municipio, "
+        "pregúntale cuál (listar_municipios trae los nombres)."
     ),
 }
 
@@ -659,6 +790,8 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
         advertencias.append(AVISO_MATRICULA)
     if f.get("docentes_oficiales") is not None:
         advertencias.append(AVISO_DOCENTES)
+    if f.get("ninos_por_terminal") is not None:
+        advertencias.append(AVISO_EQUIPOS)
 
     def _ent(valor):
         try:
@@ -680,6 +813,8 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
         {"etiqueta": "Cobertura neta", "valor": redondear(f.get("cobertura_neta")), "unidad": "%"},
         {"etiqueta": "Deserción", "valor": redondear(f.get("desercion")), "unidad": "%"},
         {"etiqueta": "Aprobación", "valor": redondear(f.get("aprobacion")), "unidad": "%"},
+        {"etiqueta": f"Estudiantes por computador · CPE {_ent(f.get('anio_ninos_por_terminal')) or ''}".strip(),
+         "valor": redondear(f.get("ninos_por_terminal")), "unidad": ""},
         {"etiqueta": "Sedes evaluadas", "valor": f.get("sedes_evaluadas"), "unidad": ""},
         {"etiqueta": "Con internet en casa", "valor": redondear(f.get("pct_internet")), "unidad": "%"},
         {"etiqueta": "Sedes rurales", "valor": redondear(f.get("pct_sedes_rurales")), "unidad": "%"},
@@ -727,8 +862,10 @@ def ficha_municipio(municipio: str, departamento: str = "") -> dict[str, Any]:
         "advertencia": AVISO_DISTANCIA,
     }
 
-    economia = None
-    if f.get("pib_miles_millones") is not None:
+    economia = economia_departamento(f.get("cod_departamento", ""), f["departamento"]) if f.get("cod_departamento") else None
+    if economia:
+        advertencias.append(AVISO_ECONOMIA)
+    elif f.get("pib_miles_millones") is not None:
         principales = como_lista(f.get("actividades_principales"))
         porcentajes = como_lista(f.get("pct_actividades_principales"))
         economia = {
@@ -1194,6 +1331,277 @@ def evolucion_municipio(municipio: str, departamento: str = "", indicador: str =
     }
 
 
+
+# --------------------------------------------------------------------------- #
+# Departamento y país
+# --------------------------------------------------------------------------- #
+
+INDICADORES_MAPA = {
+    # clave -> (columna, etiqueta, unidad, «más alto es mejor»)
+    "cobertura_neta": ("cobertura_neta", "Cobertura neta", "%", True),
+    "desercion": ("desercion", "Deserción", "%", False),
+    "senales": ("n_senales", "Señales por revisar", "", False),
+    "matricula_sobre_5_18": ("matricula_sobre_5_18", "Matriculados por cada 100 personas de 5 a 18 años", "", True),
+    "prom_matematicas": ("prom_matematicas", "Saber 11 · matemáticas", "puntos", True),
+}
+AVISO_PONDERADO = (
+    "Las tasas del agregado están ponderadas por la población de 5 a 16 años de cada "
+    "municipio (MEN): un municipio grande pesa más que uno pequeño, como en el cálculo "
+    "oficial de cobertura."
+)
+AVISO_ENTRE_DEPTOS = (
+    "Comparar departamentos entre sí es orientativo: contextos rurales, urbanos, "
+    "étnicos y de conflicto no se miden con la misma vara. La comparación que decide "
+    "prioridades es dentro del departamento."
+)
+
+
+def economia_departamento(cod_departamento: str, departamento: str, n: int = 5) -> dict[str, Any] | None:
+    """
+    Las `n` actividades con más peso en el PIB del departamento, último año.
+    Sale del PIB crudo (economia_departamental.parquet) cuando está en el corte,
+    que trae las trece actividades; la ficha precalculada solo guarda tres.
+    """
+    if not existe("pib"):
+        return None
+    try:
+        df = conexion().execute("""
+            WITH ult AS (SELECT max(anio) AS a FROM pib WHERE cod_departamento = ?)
+            SELECT actividad, sector, sum(valor_miles_millones) AS valor, (SELECT a FROM ult) AS anio
+            FROM pib WHERE cod_departamento = ? AND anio = (SELECT a FROM ult)
+            GROUP BY actividad, sector ORDER BY valor DESC
+        """, [cod_departamento, cod_departamento]).fetchdf()
+    except Exception:  # noqa: BLE001
+        return None
+    if df.empty:
+        return None
+    total = float(df["valor"].sum())
+    top = df.head(n)
+    return {
+        "ambito": f"Departamento de {departamento}",
+        "anio": int(top.iloc[0]["anio"]),
+        "pib_miles_de_millones_cop": redondear(total),
+        "actividades_principales": [
+            {"actividad": r.actividad, "pct_del_pib": redondear(r.valor / total * 100) if total else None}
+            for r in top.itertuples()
+        ],
+        "sector_dominante": top.iloc[0]["sector"],
+        "advertencia": AVISO_ECONOMIA,
+    }
+
+
+def _fila(d: dict[str, Any]) -> dict[str, Any]:
+    """Los campos de escala y tasas de una fila agregada, ya redondeados."""
+    ent = lambda k: (int(d[k]) if d.get(k) is not None and not pd.isna(d.get(k)) else None)  # noqa: E731
+    mat, pob = d.get("matricula_total"), d.get("poblacion_5_18")
+    return {
+        "poblacion": {
+            "anio": ent("anio_poblacion"), "habitantes": ent("poblacion_total"),
+            "de_5_a_18": ent("poblacion_5_18"),
+            "pct_de_5_a_18": redondear(d["poblacion_5_18"] / d["poblacion_total"] * 100)
+            if d.get("poblacion_total") and not pd.isna(d.get("poblacion_total")) and d["poblacion_total"] > 0
+            and d.get("poblacion_5_18") is not None and not pd.isna(d.get("poblacion_5_18")) else None,
+            "fuente": "DANE — proyecciones de población 2018-2042 (CNPV 2018)",
+        },
+        "matricula": {
+            "anio": ent("anio_matricula"), "estudiantes": ent("matricula_total"),
+            "oficial": ent("matricula_oficial"), "rural": ent("matricula_rural"),
+            "por_cada_100_de_5_a_18": redondear(mat / pob * 100)
+            if mat is not None and pob and not pd.isna(mat) and not pd.isna(pob) and pob > 0 else None,
+            "fuente": "Ministerio de Educación Nacional — SIMAT",
+        },
+        "docentes": {
+            "anio": ent("anio_docentes"), "docentes_oficiales": ent("docentes_oficiales"),
+            "entidades_certificadas": ent("etc_en_el_departamento"),
+            "fuente": "Ministerio de Educación Nacional — docentes oficiales EPBM",
+            "advertencia": AVISO_DOCENTES,
+        },
+        "indicadores": {
+            "anio": ent("anio_men"),
+            "poblacion_5_16": ent("poblacion_5_16"),
+            "cobertura_neta": redondear(d.get("cobertura_neta")),
+            "cobertura_bruta": redondear(d.get("cobertura_bruta")),
+            "desercion": redondear(d.get("desercion")),
+            "municipios_con_desercion_reportada": ent("municipios_con_desercion"),
+        },
+        "saber11": {
+            "mediana_matematicas": redondear(d.get("mediana_matematicas")),
+            "evaluados": ent("evaluados"),
+            "sedes_evaluadas": ent("sedes_evaluadas"),
+            "pct_internet": redondear(d.get("pct_internet")),
+        },
+        "equipos": {
+            "estudiantes_por_computador": redondear(d.get("ninos_por_terminal")),
+            "anio_desde": ent("anio_equipos_desde"), "anio_hasta": ent("anio_equipos_hasta"),
+            "municipios_con_dato": ent("municipios_con_dato_equipos"),
+            "fuente": "MinTIC — Computadores Para Educar",
+            "advertencia": AVISO_EQUIPOS,
+        },
+    }
+
+
+def _cifras_agregado(f: dict[str, Any]) -> list[dict[str, Any]]:
+    p, m, d, i, s11 = f["poblacion"], f["matricula"], f["docentes"], f["indicadores"], f["saber11"]
+    cifras = [
+        {"etiqueta": f"Habitantes · DANE {p['anio'] or ''}".strip(), "valor": p["habitantes"], "unidad": ""},
+        {"etiqueta": "Población de 5 a 18 años", "valor": p["de_5_a_18"], "unidad": ""},
+        {"etiqueta": f"Estudiantes matriculados · {m['anio'] or ''}".strip(), "valor": m["estudiantes"], "unidad": ""},
+        {"etiqueta": f"Docentes oficiales · {d['anio'] or ''}".strip(), "valor": d["docentes_oficiales"], "unidad": ""},
+        {"etiqueta": "Cobertura neta (ponderada)", "valor": i["cobertura_neta"], "unidad": "%"},
+        {"etiqueta": "Deserción (ponderada)", "valor": i["desercion"], "unidad": "%"},
+        {"etiqueta": "Mediana Saber 11 · matemáticas", "valor": s11["mediana_matematicas"], "unidad": "puntos"},
+        {"etiqueta": "Con internet en casa", "valor": s11["pct_internet"], "unidad": "%"},
+        {"etiqueta": f"Estudiantes por computador · CPE {f['equipos']['anio_hasta'] or ''}".strip(),
+         "valor": f["equipos"]["estudiantes_por_computador"], "unidad": ""},
+    ]
+    return [c for c in cifras if c["valor"] is not None]
+
+
+def _municipios_para_mapa(cod_departamento: str, columna: str) -> list[dict[str, Any]]:
+    df = conexion().execute(f"""
+        SELECT municipio, cod_municipio, lat, lon, {columna} AS valor, n_senales,
+               poblacion_total, matricula_total, cobertura_neta, desercion
+        FROM fichas_mun_ext WHERE cod_departamento = ?
+        ORDER BY municipio
+    """, [cod_departamento]).fetchdf()
+    return [{"municipio": r.municipio, "cod_municipio": r.cod_municipio,
+             "lat": redondear(r.lat, 5), "lon": redondear(r.lon, 5),
+             "valor": redondear(r.valor), "senales": int(r.n_senales) if not pd.isna(r.n_senales) else 0,
+             "habitantes": int(r.poblacion_total) if not pd.isna(r.poblacion_total) else None,
+             "matricula": int(r.matricula_total) if not pd.isna(r.matricula_total) else None,
+             "cobertura_neta": redondear(r.cobertura_neta), "desercion": redondear(r.desercion)}
+            for r in df.itertuples()]
+
+
+@mcp.tool()
+def ficha_departamento(departamento: str, indicador: str = "cobertura_neta") -> dict[str, Any]:
+    """
+    El departamento entero: habitantes, matrícula, docentes, cobertura y deserción
+    ponderadas, Saber 11, cuántos municipios tienen señales, y cada municipio con su
+    valor del `indicador` para pintarlos en el mapa y ordenarlos.
+
+    `indicador`: cobertura_neta, desercion, senales, matricula_sobre_5_18 o
+    prom_matematicas. Úsala cuando el usuario eligió departamento pero no municipio,
+    o pregunte por el departamento como un todo. Para priorizar municipios dentro de
+    él, senales_departamento trae el detalle de cada señal.
+    """
+    if not existe("fichas_depto"):
+        return vacio("Los agregados por departamento no están disponibles en este corte.")
+    if not departamento:
+        return {"encontrado": False, "requiere_ambito": True,
+                "mensaje": "Indica el departamento. listar_departamentos trae los nombres."}
+    if indicador not in INDICADORES_MAPA:
+        return vacio(f"Indicador no válido: «{indicador}».", "Válidos: " + ", ".join(INDICADORES_MAPA))
+    condicion, valor = filtro_departamento(departamento)
+    df = conexion().execute(f"SELECT * FROM fichas_depto WHERE {condicion}", [valor]).fetchdf()
+    if df.empty:
+        return vacio(f"No encontré el departamento «{departamento}».", "Usa listar_departamentos.")
+    if len(df) > 1:
+        return {"encontrado": False, "ambiguo": True,
+                "opciones": sorted(df["departamento"].tolist()),
+                "mensaje": "Varios departamentos coinciden. Pregúntale al usuario cuál."}
+    d = df.iloc[0].to_dict()
+    f = _fila(d)
+    columna, etiqueta, unidad, mejor_alto = INDICADORES_MAPA[indicador]
+    municipios = _municipios_para_mapa(d["cod_departamento"], columna)
+    con_valor = [x for x in municipios if x["valor"] is not None]
+    # Peor primero: es la lista que alguien usa para decidir dónde ir.
+    ordenados = sorted(con_valor, key=lambda x: x["valor"], reverse=not mejor_alto)
+
+    advertencias = [AVISO_PONDERADO, AVISO_SENALES, AVISO_POBLACION, AVISO_MATRICULA, AVISO_DOCENTES, AVISO_EQUIPOS]
+    return {
+        "encontrado": True,
+        "departamento": d["departamento"],
+        "cod_departamento": d["cod_departamento"],
+        "municipios": int(d["municipios"]),
+        "municipios_con_senales": int(d["municipios_con_senales"]),
+        **f,
+        "economia": economia_departamento(d["cod_departamento"], d["departamento"]),
+        "indicador": {"clave": indicador, "columna": columna, "etiqueta": etiqueta,
+                      "unidad": unidad, "mejor_alto": mejor_alto},
+        "municipios_detalle": municipios,
+        "prioridad": [{"municipio": x["municipio"], "valor": x["valor"], "senales": x["senales"]}
+                      for x in ordenados[:10]],
+        "fuente": "DANE, ICFES, Ministerio de Educación Nacional, MinTIC, Colombia Compra Eficiente",
+        "corte": corte(),
+        "advertencias": advertencias,
+        "vis": [
+            {"tipo": VIS_CIFRAS, "titulo": f"{d['departamento']} · {int(d['municipios'])} municipios",
+             "cifras": _cifras_agregado(f),
+             "nota_fuente": f"DANE · MEN {f['indicadores']['anio'] or ''} · ICFES", "advertencias": advertencias},
+            {"tipo": VIS_TABLA,
+             "titulo": f"Municipios de {d['departamento']} por {etiqueta.lower()}" + (" (peor primero)" if ordenados else ""),
+             "columnas": ["Municipio", etiqueta, "Señales", "Habitantes", "Matriculados"],
+             "filas": [[x["municipio"], x["valor"], x["senales"], x["habitantes"], x["matricula"]] for x in ordenados],
+             "nota_fuente": "MEN · DANE · ICFES", "advertencias": [AVISO_SENALES]},
+        ],
+    }
+
+
+@mcp.tool()
+def ficha_pais(indicador: str = "cobertura_neta") -> dict[str, Any]:
+    """
+    Colombia como un todo y sus 33 departamentos comparados por un `indicador`
+    (cobertura_neta, desercion, senales, matricula_sobre_5_18, prom_matematicas):
+    totales nacionales de habitantes, matrícula y docentes, tasas ponderadas, y una
+    fila por departamento para el mapa.
+
+    Úsala cuando el usuario no haya elegido territorio o pregunte por el país. La
+    comparación entre departamentos es orientativa; para decidir dónde intervenir,
+    baja al departamento con ficha_departamento.
+    """
+    if not existe("ficha_pais") or not existe("fichas_depto"):
+        return vacio("Los agregados nacionales no están disponibles en este corte.")
+    if indicador not in INDICADORES_MAPA:
+        return vacio(f"Indicador no válido: «{indicador}».", "Válidos: " + ", ".join(INDICADORES_MAPA))
+    d = conexion().execute("SELECT * FROM ficha_pais").fetchdf().iloc[0].to_dict()
+    f = _fila(d)
+    columna, etiqueta, unidad, mejor_alto = INDICADORES_MAPA[indicador]
+    col_depto = {"n_senales": "municipios_con_senales", "prom_matematicas": "mediana_matematicas",
+                 "matricula_sobre_5_18": "matricula_sobre_5_18"}.get(columna, columna)
+    deptos = conexion().execute(f"""
+        SELECT cod_departamento, departamento, municipios, municipios_con_senales,
+               poblacion_total, poblacion_5_18, matricula_total, docentes_oficiales,
+               cobertura_neta, desercion, mediana_matematicas,
+               CASE WHEN poblacion_5_18 > 0 THEN matricula_total * 100.0 / poblacion_5_18 END AS matricula_sobre_5_18,
+               {col_depto} AS valor
+        FROM fichas_depto ORDER BY departamento
+    """).fetchdf()
+    ent = lambda v: (int(v) if v is not None and not pd.isna(v) else None)  # noqa: E731
+    filas = [{"cod_departamento": r.cod_departamento, "departamento": r.departamento,
+              "municipios": int(r.municipios), "municipios_con_senales": int(r.municipios_con_senales),
+              "habitantes": ent(r.poblacion_total), "de_5_a_18": ent(r.poblacion_5_18),
+              "matricula": ent(r.matricula_total), "docentes_oficiales": ent(r.docentes_oficiales),
+              "cobertura_neta": redondear(r.cobertura_neta), "desercion": redondear(r.desercion),
+              "mediana_matematicas": redondear(r.mediana_matematicas),
+              "matricula_sobre_5_18": redondear(r.matricula_sobre_5_18),
+              "valor": redondear(r.valor)} for r in deptos.itertuples()]
+    ordenados = sorted([x for x in filas if x["valor"] is not None], key=lambda x: x["valor"], reverse=not mejor_alto)
+    advertencias = [AVISO_ENTRE_DEPTOS, AVISO_PONDERADO, AVISO_POBLACION, AVISO_MATRICULA, AVISO_DOCENTES]
+    return {
+        "encontrado": True,
+        "ambito": "Colombia",
+        "departamentos": int(d["departamentos"]),
+        "municipios": int(d["municipios"]),
+        "municipios_con_senales": int(d["municipios_con_senales"]),
+        **f,
+        "indicador": {"clave": indicador, "etiqueta": etiqueta, "unidad": unidad, "mejor_alto": mejor_alto},
+        "departamentos_detalle": filas,
+        "fuente": "DANE, ICFES, Ministerio de Educación Nacional, MinTIC",
+        "corte": corte(),
+        "advertencias": advertencias,
+        "vis": [
+            {"tipo": VIS_CIFRAS, "titulo": f"Colombia · {int(d['departamentos'])} departamentos, {int(d['municipios'])} municipios",
+             "cifras": _cifras_agregado(f),
+             "nota_fuente": f"DANE · MEN {f['indicadores']['anio'] or ''} · ICFES", "advertencias": advertencias},
+            {"tipo": VIS_TABLA,
+             "titulo": f"Departamentos por {etiqueta.lower()}" + (" (peor primero)" if ordenados else ""),
+             "columnas": ["Departamento", etiqueta, "Municipios con señales", "Habitantes", "Matriculados"],
+             "filas": [[x["departamento"], x["valor"], x["municipios_con_senales"], x["habitantes"], x["matricula"]] for x in ordenados],
+             "nota_fuente": "MEN · DANE · ICFES", "advertencias": [AVISO_ENTRE_DEPTOS]},
+        ],
+    }
+
 @mcp.tool()
 def senales_departamento(departamento: str, senal: str = "") -> dict[str, Any]:
     """
@@ -1346,24 +1754,16 @@ def token_valido(token: str) -> bool:
 
 
 @mcp.tool()
-def ranking_nacional(indicador: str, token: str, peores: bool = True, limite: int = 20) -> dict[str, Any]:
+def ranking_nacional(indicador: str, token: str = "", peores: bool = True, limite: int = 20) -> dict[str, Any]:
     """
-    Ordena todos los municipios del país por un indicador. SOLO para organizaciones
-    con acceso completo.
+    Ordena todos los municipios del país por un indicador: desercion, cobertura_neta,
+    prom_matematicas, pct_internet o n_senales. `peores`=true pone primero los que
+    peor están.
 
-    Requiere un token que el proxy inyecta; no lo pidas al usuario ni lo inventes.
-    Si no lo tienes, usa senales_departamento dentro del territorio que interese.
+    Sirve para responder «¿dónde está peor el país en X?». Recuerda en la respuesta
+    que un ranking nacional mezcla contextos distintos y que la decisión de dónde
+    intervenir se toma dentro del departamento. `token` ya no hace falta.
     """
-    if not token_valido(token):
-        return {
-            "encontrado": False,
-            "requiere_acceso_completo": True,
-            "mensaje": (
-                "La consulta nacional está reservada a organizaciones con acceso completo. "
-                "Ofrece al usuario trabajar por departamento con senales_departamento, y "
-                "cuéntale que puede solicitar acceso completo escribiendo a hola@startin.org.co."
-            ),
-        }
     permitidos = {"desercion", "cobertura_neta", "prom_matematicas", "pct_internet", "n_senales"}
     if indicador not in permitidos:
         return vacio(f"Indicador no válido: «{indicador}».", "Válidos: " + ", ".join(sorted(permitidos)))

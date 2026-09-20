@@ -331,6 +331,20 @@ real termina sin probarse.
 
 ---
 
+## Ámbitos: país, departamento, municipio, colegio
+
+Los agregados por departamento y país **se calculan al arrancar el servidor
+MCP** a partir de `fichas_municipio.parquet` (tablas `fichas_depto` y
+`ficha_pais` en DuckDB), no en la ingesta: tardan milisegundos y así un corte
+ya publicado gana la vista sin volver a correr una hora de ingesta. Si el log
+del MCP dice «No se pudieron construir los agregados», el corte es anterior a
+las columnas nuevas (población, matrícula): las herramientas `ficha_departamento`
+y `ficha_pais` responden que no están disponibles y el resto sigue.
+
+El orquestador expone `/pais?indicador=` y `/departamento?departamento=&indicador=`
+(lectura, caché de 6 h, sin cupo). `ranking_nacional` ya no exige token: la
+fundación abrió el país a todo el mundo; el freno es el presupuesto mensual.
+
 ## Niveles de acceso
 
 Quien llega tiene uno de tres niveles, y el portero decide con ellos:

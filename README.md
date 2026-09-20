@@ -334,6 +334,22 @@ presentar la comparación en vez de celebrar una brecha más corta.
 `server.py` expone las fichas como herramientas MCP. Lo consulta un agente
 alojado en Microsoft Foundry; el front solo dibuja lo que el servidor le pasa.
 
+### Del país al colegio
+
+Desde el 20 de septiembre de 2026 el agente responde en cuatro ámbitos, que la
+persona fija con los selectores de la página: **Colombia** (sin nada elegido),
+**departamento**, **municipio** y **colegio**. Las vistas de país y departamento
+son lectura precalculada —no gastan modelo ni cupo— y muestran el mapa coloreado
+por un indicador (cobertura neta por defecto; también deserción, señales,
+matriculados por cada 100 personas de 5 a 18 años y Saber 11), las cifras de
+escala y una tabla «peor primero» para bajar de nivel con un clic.
+
+Las tasas agregadas van **ponderadas por población de 5 a 16 años** del MEN, no
+como promedio simple. Los docentes de un departamento suman su ETC y las de sus
+municipios certificados, cada una una vez. La regla de fondo no cambió: cuanto
+más amplio el ámbito, más orientativa la cifra; las decisiones se toman dentro
+del departamento, y el agente lo dice.
+
 ### Toda consulta ocurre dentro de un territorio
 
 No hay forma de preguntar "por el país" por la puerta principal. Quien consulta
