@@ -97,6 +97,25 @@ LIMITE_IP_POR_HORA = int(_num("BRUJULA_LIMITE_IP_HORA", 30))
 # Los datos se refrescan una vez al mes: una respuesta de hace una semana sigue
 # siendo la respuesta correcta. Siete días es conservador a propósito.
 CACHE_DIAS = int(_num("BRUJULA_CACHE_DIAS", 7))
+# Una etiqueta que entra en la clave de la caché y permite invalidarla entera
+# cambiando una variable de entorno.
+#
+# Hace falta por dos motivos, y el segundo importa más que el primero:
+#
+#   1. Una respuesta equivocada se queda guardada. La noche del 19 de
+#      septiembre de 2026, mientras el servidor MCP estaba roto, la caché
+#      guardó varias respuestas que decían «la herramienta falló». Arreglado el
+#      servidor, esas preguntas seguían devolviendo el fallo durante una
+#      semana, y desde afuera parecía que el arreglo no había servido.
+#
+#   2. Un corte nuevo no invalida lo viejo. La clave solo mira la pregunta y el
+#      territorio, así que tras publicar datos frescos la caché seguiría
+#      sirviendo respuestas calculadas con los anteriores —con su fecha de
+#      corte adentro— hasta siete días. En una herramienta cuya promesa es que
+#      cada cifra llega con su fecha, eso no es un detalle de rendimiento.
+#
+# Al publicar un corte nuevo se cambia esta variable. Cuesta una línea.
+VERSION_CACHE = os.environ.get("BRUJULA_VERSION_CACHE", "1")
 
 # Estimación previa a la llamada. Se usa solo para decidir si ARRANCAR la
 # petición; después se reconcilia con el consumo real. Se estima alto para que
@@ -132,8 +151,13 @@ def clave_cache(pregunta: str, departamento: str, municipio: str) -> str:
     El territorio ENTRA en la clave. Sin él, «¿cómo va la cobertura?» en Soacha
     devolvería la respuesta guardada para Leticia, que es el peor error posible
     en una herramienta de diagnóstico territorial.
+
+    La versión también entra: es lo que permite tirar la caché entera cuando se
+    publica un corte nuevo o cuando quedaron guardadas respuestas de un rato en
+    que el servicio estaba roto.
     """
     crudo = "|".join([
+        VERSION_CACHE,
         normalizar_pregunta(pregunta),
         normalizar_pregunta(departamento),
         normalizar_pregunta(municipio),
