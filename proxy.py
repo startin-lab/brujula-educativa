@@ -212,6 +212,9 @@ class AlmacenMemoria:
     def esta_acreditado(self, visitante: str) -> bool:
         return visitante in self._acreditados
 
+    def desacreditar(self, visitante: str) -> None:
+        self._acreditados.discard(visitante)
+
     def leer_cache(self, clave: str) -> dict | None:
         entrada = self.cache.get(clave)
         if not entrada:
@@ -460,6 +463,13 @@ class AlmacenTablas:
 
     def esta_acreditado(self, visitante: str) -> bool:
         return self._leer("acreditado", visitante) is not None
+
+    def desacreditar(self, visitante: str) -> None:
+        try:
+            self._tabla.delete_entity("acreditado", visitante)
+        except Exception as exc:  # noqa: BLE001
+            if not self._es(exc, "ResourceNotFound", "404", "no existe"):
+                raise
 
     def leer_cache(self, clave: str) -> dict | None:
         fila = self._leer("cache", clave)

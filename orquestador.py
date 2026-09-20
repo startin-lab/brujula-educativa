@@ -45,7 +45,8 @@ Variables:
   BRUJULA_MODELO               nombre del despliegue del modelo en Foundry
   BRUJULA_TOKEN_NACIONAL       habilita las consultas de país entero
   BRUJULA_BUZON                de dónde salen los enlaces de acceso
-  BRUJULA_SITIO                dirección pública, para armar esos enlaces
+  BRUJULA_SITIO                dónde vive la página (la Static Web App)
+  BRUJULA_API                  dónde vive ESTE servicio, que es otra máquina
   BRUJULA_HORAS_ENLACE         cuánto vive un enlace de acceso (72 por defecto)
   AZURE_STORAGE_CUENTA         contadores del portero (identidad administrada)
 """
@@ -74,6 +75,24 @@ MODELO = os.environ.get("BRUJULA_MODELO", "")
 TOKEN_NACIONAL = os.environ.get("BRUJULA_TOKEN_NACIONAL", "")
 BUZON = os.environ.get("BRUJULA_BUZON", "brujula@startin.org.co")
 SITIO = os.environ.get("BRUJULA_SITIO", "https://brujula.startinlab.org")
+# Y aquí está la trampa que nos costó un correo entregado y un 404 en la cara:
+# brujula.startinlab.org es la Static Web App, que solo sabe servir archivos.
+# /entrar y /revocar son rutas de ESTE proceso, que corre en otra máquina. Un
+# enlace de acceso armado sobre SITIO apunta a un sitio que no tiene esa ruta,
+# y Azure responde su propio 404 —uno que ni siquiera parece nuestro—.
+#
+# Mientras la API no tenga nombre propio, el valor por defecto es el del
+# contenedor. Cuando acceso.brujula.startinlab.org esté en pie, se cambia esta
+# variable de entorno y los correos vuelven a salir con el dominio de la
+# fundación, sin tocar una línea de código.
+API_PROPIA = os.environ.get(
+    "BRUJULA_API",
+    "https://brujula-orquestador.ambitiousplant-035eb04f.eastus2.azurecontainerapps.io",
+).rstrip("/")
+# A dónde llega el aviso de cada registro nuevo. No es una formalidad: una
+# herramienta pública que no sabe a quién le está sirviendo no puede decir que
+# rinde cuentas. Además es el único camino para revocar un acceso.
+AVISOS = os.environ.get("BRUJULA_AVISOS", "hola@startin.org.co")
 # Un enlace de acceso que no vence es una llave tirada en un buzón para siempre.
 HORAS_ENLACE = int(os.environ.get("BRUJULA_HORAS_ENLACE", "72"))
 
@@ -376,6 +395,28 @@ def enviar_correo(destinatario: str, asunto: str, cuerpo_html: str) -> None:
         raise RuntimeError(f"Graph rechazó el envío ({exc.code}): {detalle}") from exc
 
 
+def correo_de_aviso(datos: dict, revocar: str) -> str:
+    """El aviso que llega a la fundación cuando alguien se registra."""
+    def limpio(t: str) -> str:
+        return (str(t).replace("&", "&amp;").replace("<", "&lt;")
+                      .replace(">", "&gt;").replace('"', "&quot;"))
+    return f"""\
+<p>Nuevo acceso a Br&uacute;jula Educativa.</p>
+<table cellpadding="5" style="border-collapse:collapse">
+  <tr><td><b>Nombre</b></td><td>{limpio(datos.get("nombre", ""))}</td></tr>
+  <tr><td><b>Organizaci&oacute;n</b></td><td>{limpio(datos.get("organizacion", ""))}</td></tr>
+  <tr><td><b>Correo</b></td><td>{limpio(datos.get("correo", ""))}</td></tr>
+  <tr><td valign="top"><b>Para qu&eacute;</b></td><td>{limpio(datos.get("proposito", ""))}</td></tr>
+</table>
+<p>Ya puede consultar sin l&iacute;mite. Si algo no cuadra,
+   <a href="{revocar}">revoca este acceso</a>; la persona vuelve al cupo de diez
+   consultas libres y puede registrarse de nuevo.</p>
+<p style="color:#56527A;font-size:13px">
+  Aviso autom&aacute;tico. Autoriz&oacute; el tratamiento de sus datos conforme a la
+  pol&iacute;tica de privacidad de la Fundaci&oacute;n Startin.
+</p>"""
+
+
 def correo_de_acceso(nombre: str, enlace: str) -> str:
     saludo = f"Hola, {nombre.split()[0]}." if nombre.strip() else "Hola."
     return f"""\
@@ -575,7 +616,7 @@ def crear_app():
                 status_code=503,
             )
 
-        enlace = f"{SITIO}/entrar?t={ficha}"
+        enlace = f"{API_PROPIA}/entrar?t={ficha}"
         try:
             enviar_correo(
                 datos.correo,
@@ -589,6 +630,21 @@ def crear_app():
                            "correo. Escríbenos a hola@startin.org.co."},
                 status_code=502,
             )
+        # El aviso a la fundación va después y no puede tumbar el registro:
+        # que nuestro correo interno falle no es problema de quien se registró.
+        try:
+            enviar_correo(
+                AVISOS,
+                f"Brújula: nuevo acceso — {datos.organizacion}",
+                correo_de_aviso(
+                    {"nombre": datos.nombre, "organizacion": datos.organizacion,
+                     "correo": datos.correo, "proposito": datos.proposito},
+                    f"{API_PROPIA}/revocar?t={ficha}",
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo avisar del registro a %s", AVISOS)
+
         return JSONResponse({"motivo": "Listo. Te enviamos un enlace de acceso al "
                                        "correo; revisa también la carpeta de no deseados."})
 
@@ -613,9 +669,46 @@ def crear_app():
         # donde se llenó el formulario.
         credencial = secrets.token_urlsafe(24)
         portero.almacen.acreditar(credencial)
-        portero.almacen.marcar_registro_usado(t)
+        # Se guarda junto al registro: sin esto, revocar sería imposible.
+        portero.almacen.guardar_registro(t, {**datos, "usado": True,
+                                             "credencial": credencial})
         return RedirectResponse(f"{SITIO}/consultar.html#acceso={credencial}",
                                 status_code=303)
+
+
+    @app.get("/revocar")
+    async def revocar(t: str = ""):
+        """
+        Quita un acceso concedido. El enlace vive solo en el aviso interno.
+
+        Revocar es deliberadamente poco dramático: la persona vuelve al cupo de
+        diez consultas libres y puede registrarse otra vez. No es un castigo,
+        es deshacer.
+        """
+        from fastapi.responses import PlainTextResponse
+
+        portero = estado["portero"]
+        try:
+            datos = portero.almacen.leer_registro(t) if t else None
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudo leer el registro al revocar")
+            datos = None
+
+        if not datos:
+            return PlainTextResponse("Ese enlace de revocación no corresponde a "
+                                     "ningún acceso.", status_code=404)
+
+        credencial = datos.get("credencial")
+        if credencial:
+            portero.almacen.desacreditar(credencial)
+        portero.almacen.guardar_registro(t, {**datos, "revocado": True,
+                                             "credencial": None})
+        quien = datos.get("correo", "ese acceso")
+        LOG.info("Acceso revocado: %s (%s)", quien, datos.get("organizacion", ""))
+        return PlainTextResponse(
+            f"Listo. El acceso de {quien} quedó revocado: vuelve al cupo de diez "
+            f"consultas libres y puede registrarse de nuevo si hace falta."
+        )
 
 
     return app
