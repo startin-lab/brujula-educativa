@@ -360,6 +360,31 @@ class AlmacenTablas:
                 return None
             raise
 
+    @staticmethod
+    def _etiqueta(entidad) -> str | None:
+        """
+        El etag de una fila, que es lo que permite escribir sin pisar a otro.
+
+        Está aquí porque cuesta encontrarlo: el SDK no lo devuelve como una
+        columna más, sino colgado en `.metadata`. Convertir la entidad a dict
+        —que es lo natural y lo que hacía `_leer`— lo tira a la basura sin
+        decir nada, y la escritura condicionada falla después con un mensaje
+        que habla de otra cosa: «IfNotModified must be specified with etag».
+        """
+        meta = getattr(entidad, "metadata", None) or {}
+        return (meta.get("etag") or meta.get("odata.etag")
+                or entidad.get("odata.etag") or entidad.get("etag"))
+
+    def _leer_con_etiqueta(self, particion: str, clave: str):
+        """Como _leer, pero además devuelve el etag. Lo usa la suma atómica."""
+        try:
+            entidad = self._tabla.get_entity(particion, clave)
+        except Exception as exc:  # noqa: BLE001
+            if self._es(exc, "ResourceNotFound", "404", "no existe"):
+                return None, None
+            raise
+        return dict(entidad), self._etiqueta(entidad)
+
     def _sumar_atomico(self, particion: str, clave: str, campo: str, delta: float) -> float:
         """
         Suma sin perder actualizaciones. Relee y reintenta mientras otra réplica
@@ -372,7 +397,7 @@ class AlmacenTablas:
                 # Espera creciente con ruido: sin el ruido, las réplicas que
                 # chocaron vuelven a chocar todas juntas en el mismo instante.
                 time.sleep(random.uniform(0, 0.02 * (2 ** min(intento, 5))))
-            actual = self._leer(particion, clave)
+            actual, etiqueta = self._leer_con_etiqueta(particion, clave)
             if actual is None:
                 nueva = {"PartitionKey": particion, "RowKey": clave, campo: delta}
                 try:
@@ -385,11 +410,20 @@ class AlmacenTablas:
             valor = float(actual.get(campo, 0.0)) + delta
             actual[campo] = valor
             try:
-                self._tabla.update_entity(
-                    actual, mode=_UpdateMode.REPLACE,
-                    etag=actual.get("etag") or actual.get("odata.etag"),
-                    match_condition=_MatchConditions.IfNotModified,
-                )
+                if etiqueta:
+                    self._tabla.update_entity(
+                        actual, mode=_UpdateMode.REPLACE, etag=etiqueta,
+                        match_condition=_MatchConditions.IfNotModified,
+                    )
+                else:
+                    # Sin etag no hay forma de condicionar la escritura, y
+                    # escribir a ciegas es exactamente como un contador
+                    # empieza a mentir. Esto no es una carrera perdida sino un
+                    # problema de estructura, así que no se reintenta: se dice.
+                    raise RuntimeError(
+                        f"La fila {particion}/{clave} llegó sin etag; sin él no "
+                        f"se puede sumar sin arriesgar perder actualizaciones."
+                    )
                 return valor
             except ConflictoDeVersion:
                 continue
