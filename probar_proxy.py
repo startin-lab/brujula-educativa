@@ -335,6 +335,46 @@ def main() -> int:
     p.registrar_consumo("otra", ip, "navegador-reg", {"r": 1}, 1000, 100, "META", "Villavicencio", registrado=True)
     check("y su consulta no gasta el cupo libre de la conexión", p.almacen.libres_ip_hoy(ip) == tope, p.almacen.libres_ip_hoy(ip))
 
+    print("\n== 17. Niveles de acceso: registrado e interno ==")
+    p = P.Portero(presupuesto_diario_usd=100.0)
+    p.almacen.acreditar("cred-reg", nivel="registrado", correo="ana@narino.gov.co")
+    p.almacen.acreditar("cred-int", nivel="interno", correo="freddym@startin.org.co")
+    p.almacen.acreditar("cred-vieja")     # acreditada antes de que existieran niveles
+    check("una credencial registrada informa su nivel", p.almacen.nivel_de("cred-reg") == "registrado", p.almacen.nivel_de("cred-reg"))
+    check("una interna también", p.almacen.nivel_de("cred-int") == "interno", p.almacen.nivel_de("cred-int"))
+    check("una anterior a los niveles cuenta como registrada", p.almacen.nivel_de("cred-vieja") == "registrado", p.almacen.nivel_de("cred-vieja"))
+    check("una desconocida no tiene nivel", p.almacen.nivel_de("nadie") == "", p.almacen.nivel_de("nadie"))
+    cuenta = p.almacen.contar_acreditados()
+    check("el conteo separa los niveles", cuenta.get("interno") == 1 and cuenta.get("registrado") == 2, cuenta)
+    # El interno se salta el límite por hora y el presupuesto del día...
+    for i in range(P.LIMITE_IP_POR_HORA + 2):
+        p.almacen.registrar_peticion("1.1.1.1")
+    v_pub = p.evaluar("x", "1.1.1.1", "cred-reg", "META", "Villavicencio", registrado=True)
+    check("una persona registrada sí se frena por el límite de la hora", v_pub.codigo == 429, v_pub.codigo)
+    v_int = p.evaluar("x", "1.1.1.1", "cred-int", "META", "Villavicencio", registrado=True, acceso_completo=True)
+    check("una interna no", v_int.permitir, v_int.motivo)
+    p2 = P.Portero(presupuesto_diario_usd=0.01)
+    v_pub2 = p2.evaluar("x", "2.2.2.2", "cred-reg", "META", "Villavicencio", registrado=True)
+    check("agotado el presupuesto del día, el público recibe 503", v_pub2.codigo == 503, v_pub2.codigo)
+    v_int2 = p2.evaluar("x", "2.2.2.2", "cred-int", "META", "Villavicencio", registrado=True, acceso_completo=True)
+    check("la interna sigue (una demostración no muere por la cuota del día)", v_int2.permitir, v_int2.motivo)
+    p.almacen.desacreditar("cred-int")
+    check("revocar borra el nivel", p.almacen.nivel_de("cred-int") == "", p.almacen.nivel_de("cred-int"))
+
+    print("\n== 18. El tope del mes lo frena todo, también al equipo ==")
+    p = P.Portero(presupuesto_diario_usd=1000.0)
+    mes = p._hoy()[:7]
+    # Se reparte el gasto en varios días del mes para probar que se suma el mes entero.
+    p.almacen.sumar_gasto(f"{mes}-01", P.PRESUPUESTO_MENSUAL_USD * 0.6)
+    p.almacen.sumar_gasto(p._hoy(), P.PRESUPUESTO_MENSUAL_USD * 0.4)
+    check("el gasto del mes suma todos los días", abs(p.almacen.gasto_del_mes(mes) - P.PRESUPUESTO_MENSUAL_USD) < 1e-6, p.almacen.gasto_del_mes(mes))
+    v_pub = p.evaluar("x", "3.3.3.3", "alguien", "META", "Villavicencio")
+    check("el público recibe 503 con el mensaje del mes", v_pub.codigo == 503 and "mes" in v_pub.motivo, (v_pub.codigo, v_pub.motivo))
+    v_int = p.evaluar("x", "3.3.3.3", "cred-int", "META", "Villavicencio", registrado=True, acceso_completo=True)
+    check("y el acceso interno también: es el compromiso duro", v_int.codigo == 503 and not v_int.permitir, v_int.codigo)
+    res = p.estado()
+    check("el resumen informa el gasto del mes", res.get("gastado_mes_usd") is not None, res.get("gastado_mes_usd"))
+
     print("\n" + "=" * 64)
     if FALLOS:
         print(f"FALLARON {len(FALLOS)}:")

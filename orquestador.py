@@ -66,6 +66,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 LOG = logging.getLogger("brujula.orquestador")
@@ -96,6 +97,19 @@ API_PROPIA = os.environ.get(
 AVISOS = os.environ.get("BRUJULA_AVISOS", "hola@startin.org.co")
 # Un enlace de acceso que no vence es una llave tirada en un buzón para siempre.
 HORAS_ENLACE = int(os.environ.get("BRUJULA_HORAS_ENLACE", "72"))
+# Dominios de correo de la casa. Quien confirme un enlace de acceso enviado a
+# uno de estos dominios entra con nivel «interno»: sin cupo, sin tope por IP,
+# sin corte diario, con consultas de país entero, y con el panel de
+# administración. La verificación es el propio enlace: para tenerlo hay que
+# poder leer ese buzón. Comparación exacta del dominio, no «termina en».
+DOMINIOS_INTERNOS = {d.strip().lower() for d in
+                     os.environ.get("BRUJULA_DOMINIOS_INTERNOS", "startin.org.co").split(",")
+                     if d.strip()}
+
+
+def nivel_para(correo: str) -> str:
+    dominio = (correo or "").rsplit("@", 1)[-1].strip().lower()
+    return "interno" if dominio in DOMINIOS_INTERNOS else "registrado"
 
 # Cuántas vueltas de herramientas se permiten antes de cortar. Una pregunta
 # normal usa dos o tres. El tope existe para que un modelo que se enreda no
@@ -569,26 +583,29 @@ def crear_app():
         autoriza: bool = False
         politica: str = ""
 
-    def _acreditado(portero: Any, visitante: str) -> bool:
-        """¿Este visitante trae una credencial vigente? Fallar aquí no puede
-        tumbar la consulta: en la duda se le trata como visitante libre."""
+    def _nivel(portero: Any, visitante: str) -> str:
+        """El nivel de la credencial: "" (libre), "registrado" o "interno".
+        Fallar aquí no puede tumbar la consulta: en la duda, visitante libre."""
         if not visitante:
-            return False
+            return ""
         try:
-            return bool(portero.almacen.esta_acreditado(visitante))
+            return portero.almacen.nivel_de(visitante) or ""
         except Exception:  # noqa: BLE001
             LOG.exception("No se pudo comprobar la acreditación")
-            return False
+            return ""
 
-    def _estado_visitante(portero: Any, visitante: str, registrado: bool) -> dict:
+    def _acreditado(portero: Any, visitante: str) -> bool:
+        return bool(_nivel(portero, visitante))
+
+    def _estado_visitante(portero: Any, visitante: str, registrado: bool, nivel: str = "") -> dict:
         if registrado:
-            return {"registrado": True, "restantes": None}
+            return {"registrado": True, "restantes": None, "nivel": nivel or "registrado"}
         try:
             usadas = portero.almacen.preguntas_usadas(visitante) if visitante else 0
         except Exception:  # noqa: BLE001
             LOG.exception("No se pudieron leer las consultas usadas")
             usadas = 0
-        return {"registrado": False,
+        return {"registrado": False, "nivel": "",
                 "restantes": max(0, proxy.PREGUNTAS_LIBRES - usadas)}
 
     estado: dict[str, Any] = {}
@@ -630,7 +647,7 @@ def crear_app():
         allow_origins=[o for o in os.environ.get(
             "BRUJULA_ORIGENES", "https://brujula.startinlab.org").split(",") if o],
         allow_methods=["POST", "GET"],
-        allow_headers=["content-type"],
+        allow_headers=["content-type", "x-brujula-acceso"],
     )
 
     @app.get("/salud")
@@ -670,11 +687,15 @@ def crear_app():
         # la credencial llegaba, se guardaba en el navegador, y el tope seguía
         # cayendo igual a la consulta once. Quien se toma el trabajo de contar
         # quién es y para qué merece que eso tenga efecto.
-        registrado = _acreditado(portero, visitante)
+        nivel = _nivel(portero, visitante)
+        registrado = bool(nivel)
+        # Solo el acceso interno abre el país entero y se salta los topes.
+        acceso_completo = nivel == "interno"
 
         veredicto = portero.evaluar(
             consulta.pregunta, ip, visitante,
             consulta.departamento, consulta.municipio,
+            acceso_completo=acceso_completo,
             registrado=registrado, sede=consulta.sede,
         )
         if veredicto.desde_cache and veredicto.respuesta:
@@ -690,6 +711,7 @@ def crear_app():
             resultado = await responder(
                 consulta.pregunta, consulta.departamento, consulta.municipio,
                 estado["herramientas"], estado["modelo"],
+                acceso_completo=acceso_completo,
                 sede=consulta.sede, cod_sede=consulta.cod_sede,
             )
         except Exception as exc:  # noqa: BLE001
@@ -708,7 +730,7 @@ def crear_app():
         )
         LOG.info("Consulta atendida: %s vueltas, %.4f USD", resultado["vueltas"], usd)
         return JSONResponse({**resultado, "desde_cache": False,
-                             **_estado_visitante(portero, visitante, registrado)})
+                             **_estado_visitante(portero, visitante, registrado, nivel)})
 
     @app.get("/territorios")
     async def territorios():
@@ -820,6 +842,116 @@ def crear_app():
             listas[clave] = {"datos": salida, "cuando": time.time()}
         return JSONResponse(salida, headers={"cache-control": "public, max-age=1800"})
 
+
+    # ------------------------------------------------------------------ #
+    #  Administración. Solo con credencial de nivel «interno», que se
+    #  obtiene confirmando un enlace enviado a un correo de la fundación.
+    #  La credencial viaja en una cabecera, nunca en la URL: una URL acaba
+    #  en el historial, en un pantallazo, en un mensaje reenviado.
+    # ------------------------------------------------------------------ #
+
+    def _exigir_interno(peticion: Request):
+        credencial = (peticion.headers.get("x-brujula-acceso") or "").strip()
+        if not credencial or _nivel(estado["portero"], credencial) != "interno":
+            return JSONResponse({"motivo": "Este panel es solo para el equipo de la fundación. "
+                                           "Entra con un enlace enviado a tu correo institucional."},
+                                status_code=403)
+        return None
+
+    @app.get("/admin/resumen")
+    async def admin_resumen(peticion: Request):
+        """
+        Quién se ha registrado y cuánto se está usando. Para el equipo.
+
+        Junta lo que el portero ya cuenta —gasto, consultas, accesos— con la
+        lista de registros. No hay una base de datos aparte de «analítica»:
+        una herramienta que promete no rastrear a nadie no debería tenerla.
+        """
+        negado = _exigir_interno(peticion)
+        if negado:
+            return negado
+        portero = estado["portero"]
+        alm = portero.almacen
+        hoy = datetime.now(timezone.utc).date()
+
+        registros = []
+        try:
+            for r in alm.listar_registros():
+                registros.append({
+                    "ficha": r.get("ficha"),
+                    "nombre": r.get("nombre"), "organizacion": r.get("organizacion"),
+                    "correo": r.get("correo"), "proposito": r.get("proposito"),
+                    "cuando": r.get("cuando"),
+                    "estado": ("revocado" if r.get("revocado") else
+                               "activo" if r.get("usado") else "sin confirmar"),
+                    "nivel": nivel_para(r.get("correo", "")) if r.get("usado") else "",
+                })
+        except Exception:  # noqa: BLE001
+            LOG.exception("No se pudieron listar los registros")
+        registros.sort(key=lambda r: r.get("cuando") or 0, reverse=True)
+
+        dias = []
+        for i in range(13, -1, -1):
+            d = hoy - timedelta(days=i)
+            clave = d.strftime("%Y-%m-%d")
+            try:
+                dias.append({"dia": clave,
+                             "consultas": alm.consultas_del_dia(clave),
+                             "usd": round(alm.gasto_del_dia(clave), 4)})
+            except Exception:  # noqa: BLE001
+                dias.append({"dia": clave, "consultas": None, "usd": None})
+
+        try:
+            accesos = alm.contar_acreditados()
+        except Exception:  # noqa: BLE001
+            accesos = {}
+        try:
+            gasto_mes = round(alm.gasto_del_mes(hoy.strftime("%Y-%m")), 4)
+        except Exception:  # noqa: BLE001
+            gasto_mes = None
+
+        return JSONResponse({
+            "generado": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "registros": registros,
+            "totales": {
+                "registros": len(registros),
+                "activos": sum(1 for r in registros if r["estado"] == "activo"),
+                "sin_confirmar": sum(1 for r in registros if r["estado"] == "sin confirmar"),
+                "revocados": sum(1 for r in registros if r["estado"] == "revocado"),
+                "accesos_vigentes": accesos,
+            },
+            "uso": {
+                "dias": dias,
+                "gasto_mes_usd": gasto_mes,
+                "presupuesto_mensual_usd": proxy.PRESUPUESTO_MENSUAL_USD,
+                "presupuesto_diario_usd": round(portero.presupuesto_diario, 2),
+                "herramientas": len(estado["herramientas"].catalogo),
+                "modelo": MODELO,
+            },
+        })
+
+    @app.post("/admin/revocar")
+    async def admin_revocar(peticion: Request):
+        """Revoca un acceso desde el panel. Misma operación que /revocar, otra puerta."""
+        negado = _exigir_interno(peticion)
+        if negado:
+            return negado
+        try:
+            cuerpo = await peticion.json()
+        except Exception:  # noqa: BLE001
+            cuerpo = {}
+        ficha = str((cuerpo or {}).get("ficha") or "")
+        portero = estado["portero"]
+        datos = portero.almacen.leer_registro(ficha) if ficha else None
+        if not datos:
+            return JSONResponse({"motivo": "No existe ese registro."}, status_code=404)
+        credencial = datos.get("credencial")
+        if credencial:
+            portero.almacen.desacreditar(credencial)
+        portero.almacen.guardar_registro(ficha, {**datos, "revocado": True, "credencial": None})
+        LOG.info("Acceso revocado desde el panel: %s", datos.get("correo", "?"))
+        return JSONResponse({"motivo": f"Acceso de {datos.get('correo', 'ese registro')} revocado."})
+
     @app.get("/estado")
     async def estado_de_visitante(v: str = "", peticion: Request = None):
         """
@@ -833,8 +965,8 @@ def crear_app():
         """
         portero = estado["portero"]
         quien = v or (_ip_del_cliente(peticion) if peticion else "")
-        registrado = _acreditado(portero, quien)
-        return JSONResponse(_estado_visitante(portero, quien, registrado))
+        nivel = _nivel(portero, quien)
+        return JSONResponse(_estado_visitante(portero, quien, bool(nivel), nivel))
 
     @app.post("/registrar")
     async def registrar(datos: Registro) -> JSONResponse:
@@ -919,7 +1051,9 @@ def crear_app():
         # en el dispositivo donde se abra el correo, que rara vez es el mismo
         # donde se llenó el formulario.
         credencial = secrets.token_urlsafe(24)
-        portero.almacen.acreditar(credencial)
+        nivel = nivel_para(datos.get("correo", ""))
+        portero.almacen.acreditar(credencial, nivel=nivel, correo=datos.get("correo", ""))
+        LOG.info("Acceso %s concedido a %s", nivel, datos.get("correo", "?"))
         # Se guarda junto al registro: sin esto, revocar sería imposible.
         portero.almacen.guardar_registro(t, {**datos, "usado": True,
                                              "credencial": credencial})

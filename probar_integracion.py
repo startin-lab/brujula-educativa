@@ -177,7 +177,10 @@ def _comprobar() -> int:
     import orquestador
     modelo = ModeloSimulado()
     orquestador.cliente_modelo = lambda: modelo
-    orquestador.enviar_correo = lambda *a, **k: None
+    # Los correos no salen: se guardan para leer el enlace de acceso como lo
+    # haría la persona que lo recibe.
+    correos: list[tuple[str, str, str]] = []
+    orquestador.enviar_correo = lambda dest, asunto, html: correos.append((dest, asunto, html))
 
     from fastapi.testclient import TestClient
 
@@ -252,6 +255,63 @@ def _comprobar() -> int:
             "correo": "ana@boyaca.gov.co", "autoriza": True,
             "proposito": "Diagnóstico de cobertura en municipios del norte"})
         ok(r3.status_code == 200, "el registro responde 200")
+
+        print("\n== 6. Un correo de Startin entra con acceso interno y ve el panel ==")
+        import re
+        def entrar_con(correo: str) -> str:
+            """Registro → enlace del correo → credencial, como lo vive la persona."""
+            correos.clear()
+            r = cliente.post("/registrar", json={
+                "nombre": "Prueba", "organizacion": "Org", "correo": correo,
+                "autoriza": True, "proposito": "Probar niveles de acceso"})
+            assert r.status_code == 200, r.text
+            enlace = next(re.search(r"/entrar\?t=([A-Za-z0-9_-]+)", html).group(1)
+                          for dest, _, html in correos if dest == correo)
+            r = cliente.get("/entrar", params={"t": enlace}, follow_redirects=False)
+            assert r.status_code == 303, r.status_code
+            return re.search(r"#acceso=([A-Za-z0-9_-]+)", r.headers["location"]).group(1)
+
+        cred_int = entrar_con("freddym@startin.org.co")
+        cred_reg = entrar_con("ana@boyaca.gov.co")
+        e_int = cliente.get("/estado", params={"v": cred_int}).json()
+        e_reg = cliente.get("/estado", params={"v": cred_reg}).json()
+        ok(e_int.get("registrado") is True and e_int.get("nivel") == "interno",
+           f"el correo @startin.org.co queda con nivel interno ({e_int})")
+        ok(e_reg.get("registrado") is True and e_reg.get("nivel") == "registrado",
+           f"otro correo queda registrado, sin más ({e_reg})")
+        # Muchas más preguntas que el cupo libre, siempre desde la misma IP del
+        # cliente de pruebas: ni el cupo ni el tope por IP deben aparecer.
+        codigos = set()
+        for i in range(__import__("proxy").PREGUNTAS_LIBRES_IP_DIA + 5):
+            r = cliente.post("/preguntar", json={"pregunta": f"pregunta interna {i}", "departamento": "NARIÑO",
+                "municipio": "Tumaco", "visitante": cred_int})
+            codigos.add(r.status_code)
+        ok(codigos == {200}, f"el acceso interno no se frena por cupo ni por IP ({sorted(codigos)})")
+        ok(r.json().get("registrado") is True and r.json().get("restantes") is None,
+           "y la respuesta no le cuenta consultas libres")
+
+        ad = cliente.get("/admin/resumen", headers={"X-Brujula-Acceso": cred_int})
+        ok(ad.status_code == 200, f"/admin/resumen abre con la credencial interna ({ad.status_code})")
+        cuerpo = ad.json()
+        ok(cuerpo["totales"]["registros"] >= 3 and cuerpo["totales"]["activos"] >= 2,
+           f"lista los registros y cuántos están activos ({cuerpo['totales']})")
+        ok(any(r.get("correo") == "freddym@startin.org.co" and r.get("nivel") == "interno" for r in cuerpo["registros"]),
+           "marca el registro interno como tal")
+        ok(len(cuerpo["uso"]["dias"]) == 14 and cuerpo["uso"]["presupuesto_mensual_usd"] > 0,
+           "trae 14 días de uso y el presupuesto del mes")
+        ok(cliente.get("/admin/resumen", headers={"X-Brujula-Acceso": cred_reg}).status_code == 403,
+           "una credencial registrada corriente recibe 403")
+        ok(cliente.get("/admin/resumen").status_code == 403, "sin cabecera, 403")
+        ok(cliente.get("/admin/resumen", params={"acceso": cred_int}).status_code == 403,
+           "la credencial en la URL no sirve: solo en la cabecera")
+
+        ficha_reg = next(r["ficha"] for r in cuerpo["registros"] if r.get("correo") == "ana@boyaca.gov.co" and r["estado"] == "activo")
+        rv = cliente.post("/admin/revocar", json={"ficha": ficha_reg}, headers={"X-Brujula-Acceso": cred_int})
+        ok(rv.status_code == 200, f"revocar desde el panel responde 200 ({rv.status_code})")
+        ok(cliente.get("/estado", params={"v": cred_reg}).json().get("registrado") is False,
+           "y la persona vuelve al cupo libre")
+        ok(cliente.post("/admin/revocar", json={"ficha": ficha_reg}, headers={"X-Brujula-Acceso": cred_reg}).status_code == 403,
+           "nadie más puede revocar")
 
     print("\n" + "=" * 64)
     if fallos:

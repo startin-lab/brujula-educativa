@@ -207,10 +207,12 @@ def main() -> int:
         chip = pagina.inner_text("#chip-cupo").strip()
         # inner_text devuelve el texto como se ve, y el chip va en mayúsculas por CSS.
         ok(chip.lower() == "9 consultas libres", f"el contador baja a 9 (dice «{chip}»)")
-        rotulos = pagina.eval_on_selector_all(".plano .punto b", "els => els.length")
-        ok(rotulos == 1, f"el mapa con 31 puntos rotula solo el destacado ({rotulos} rótulo)")
-        ok("31" not in pagina.inner_text(".vis") or "sin rotular" in pagina.inner_text("#bloques"),
-           "y dice cuántos quedan sin rótulo")
+        # El «mapita» de puntos se retiró a petición del equipo: no aportaba
+        # nada que la ficha inicial no muestre ya sobre el mapa del departamento.
+        ok(pagina.eval_on_selector_all(".plano", "els => els.length") == 0,
+           "el mapa de puntos «Dónde queda…» ya no se pinta en las respuestas")
+        ok(pagina.eval_on_selector_all("#bloques .vis", "els => els.length") == 2,
+           "las otras dos visualizaciones sí se pintan")
         ok("Cobertura neta baja" in pagina.inner_text("#bloques"), "la señal se muestra legible, no como identificador")
         ok(enviados and enviados[-1].get("sede") == "" and enviados[-1].get("cod_sede") == "",
            "sin colegio elegido, la consulta va sobre todo el municipio")
@@ -271,6 +273,108 @@ def main() -> int:
         pagina.wait_for_timeout(500)
         ok(not errores, "sin errores de JavaScript")
         ok(pagina.eval_on_selector("#caducado", "e => !e.hidden"), "el aviso de enlace caducado se ve")
+
+        print("\n== 8. El botón de tema fija claro u oscuro y lo recuerda ==")
+        pagina.emulate_media(color_scheme="light")
+        pagina.click("#tema")
+        ok(pagina.evaluate("document.documentElement.dataset.theme") == "dark",
+           "con el sistema en claro, el primer toque pone oscuro")
+        fondo = pagina.evaluate("getComputedStyle(document.body).backgroundColor")
+        ok(fondo == "rgb(7, 5, 31)", f"y el fondo cambia de verdad ({fondo})")
+        pagina.goto(f"{base}/consultar.html")
+        pagina.wait_for_timeout(300)
+        ok(pagina.evaluate("document.documentElement.dataset.theme") == "dark",
+           "la elección se conserva al pasar al agente")
+        pagina.click("#tema")
+        ok(pagina.evaluate("document.documentElement.dataset.theme") == "light", "segundo toque: claro")
+        pagina.click("#tema")
+        ok(pagina.evaluate("document.documentElement.dataset.theme || ''") == "", "tercer toque: automático")
+        ok(not errores, "sin errores de JavaScript")
+
+        print("\n== 9. Acceso interno: chip propio, enlace al panel y panel funcional ==")
+        RESUMEN = {
+            "generado": "2026-09-20T01:00:00+00:00",
+            "registros": [
+                {"ficha": "f1", "nombre": "Freddy Malaver", "organizacion": "Fundación Startin",
+                 "correo": "freddym@startin.org.co", "proposito": "Demostraciones", "cuando": 1758300000,
+                 "estado": "activo", "nivel": "interno"},
+                {"ficha": "f2", "nombre": "Ana Ruiz", "organizacion": "Secretaría de Nariño",
+                 "correo": "ana@narino.gov.co", "proposito": "Cobertura", "cuando": 1758200000,
+                 "estado": "activo", "nivel": "registrado"},
+                {"ficha": "f3", "nombre": "Sin Confirmar", "organizacion": "X", "correo": "x@x.co",
+                 "proposito": "-", "cuando": 1758100000, "estado": "sin confirmar", "nivel": ""},
+            ],
+            "totales": {"registros": 3, "activos": 2, "sin_confirmar": 1, "revocados": 0,
+                        "accesos_vigentes": {"interno": 1, "registrado": 1}},
+            "uso": {"dias": [{"dia": f"2026-09-{d:02d}", "consultas": d, "usd": d * 0.01} for d in range(7, 21)],
+                    "gasto_mes_usd": 12.5, "presupuesto_mensual_usd": 300.0, "presupuesto_diario_usd": 9.0,
+                    "herramientas": 13, "modelo": "gpt-4.1-mini"},
+        }
+        revocados: list[str] = []
+        def ruta_interno(route, request):
+            url = request.url
+            cab = request.headers.get("x-brujula-acceso", "")
+            if url.startswith(f"{API}/estado"):
+                return route.fulfill(status=200, content_type="application/json",
+                    headers={"access-control-allow-origin": "*"},
+                    body=json.dumps({"registrado": True, "restantes": None, "nivel": "interno"}))
+            if url.startswith(f"{API}/admin/"):
+                if request.method == "OPTIONS":
+                    return route.fulfill(status=204, headers={
+                        "access-control-allow-origin": "*", "access-control-allow-methods": "GET, POST, OPTIONS",
+                        "access-control-allow-headers": "content-type, x-brujula-acceso"})
+                if cab != "cred-interna":
+                    return route.fulfill(status=403, content_type="application/json",
+                        headers={"access-control-allow-origin": "*"}, body=json.dumps({"motivo": "no"}))
+                if url.startswith(f"{API}/admin/revocar"):
+                    revocados.append(json.loads(request.post_data or "{}").get("ficha"))
+                    RESUMEN["registros"][1]["estado"] = "revocado"
+                    return route.fulfill(status=200, content_type="application/json",
+                        headers={"access-control-allow-origin": "*"}, body=json.dumps({"motivo": "ok"}))
+                return route.fulfill(status=200, content_type="application/json",
+                    headers={"access-control-allow-origin": "*"}, body=json.dumps(RESUMEN, ensure_ascii=False))
+            return ruta(route, request)
+        pagina.unroute(f"{API}/**")
+        pagina.route(f"{API}/**", ruta_interno)
+        # Entra por un enlace como el del correo: la credencial va en el fragmento.
+        # (Desde otra página: si solo cambiara el fragmento, el navegador no
+        # recargaría y la credencial nunca se leería.)
+        pagina.goto("about:blank")
+        pagina.goto(f"{base}/consultar.html#acceso=cred-interna")
+        pagina.wait_for_timeout(700)
+        ok("#acceso" not in pagina.url, "la credencial se borra de la barra de direcciones")
+        chip = pagina.inner_text("#chip-cupo").strip().lower()
+        ok("interno" in chip and "startin" in chip, f"el chip dice acceso interno ({chip})")
+        ok(pagina.eval_on_selector("#admin-enlace", "e => !e.hidden"), "y aparece el enlace al panel del equipo")
+        ok(pagina.eval_on_selector("#registro-en-linea", "e => e.hidden"), "sin formulario de registro para quien ya entró")
+        pagina.click("#admin-enlace")
+        pagina.wait_for_selector("#panel:not([hidden])", timeout=5000)
+        ok(pagina.eval_on_selector("#aviso", "e => e.hidden"), "el panel abre sin aviso de acceso denegado")
+        tarjetas = pagina.inner_text("#tarjetas")
+        ok("3" in tarjetas and "2 activos" in tarjetas, "las tarjetas muestran registros y activos")
+        ok("USD 12.50" in pagina.inner_text("#gasto-mes") and "USD 300.00" in pagina.inner_text("#tope-mes"),
+           "el presupuesto del mes se ve con gasto y tope")
+        ok(pagina.eval_on_selector_all("#dias .dia", "els => els.length") == 14, "14 días de consultas")
+        filas = pagina.eval_on_selector_all("#tabla-registros tbody tr", "els => els.length")
+        ok(filas == 3, f"la tabla lista los 3 registros ({filas})")
+        ok("freddym@startin.org.co" in pagina.inner_text("#tabla-registros"), "con el correo de cada uno")
+        ok(pagina.eval_on_selector_all("#tabla-registros .estado.interno", "els => els.length") == 1,
+           "y distingue el acceso interno")
+        pagina.on("dialog", lambda d: d.accept())
+        pagina.click("#tabla-registros button[data-ficha='f2']")
+        pagina.wait_for_timeout(700)
+        ok(revocados == ["f2"], "revocar manda la ficha correcta al servicio")
+        ok(pagina.eval_on_selector_all("#tabla-registros .estado.revocado", "els => els.length") == 1,
+           "y la tabla se refresca mostrando el acceso revocado")
+        ok(not errores, "sin errores de JavaScript en el panel" + (f" → {errores[0][:90]}" if errores else ""))
+
+        print("\n== 10. Sin acceso interno, el panel no muestra nada ==")
+        pagina.evaluate("localStorage.setItem('brujula-visitante', 'otra')")
+        pagina.goto(f"{base}/admin.html")
+        pagina.wait_for_selector("#aviso:not([hidden])", timeout=5000)
+        ok(pagina.eval_on_selector("#panel", "e => e.hidden"), "el panel queda oculto")
+        ok("startin" in pagina.inner_text("#aviso").lower(), "y explica cómo se consigue el acceso")
+        ok(not errores, "sin errores de JavaScript")
 
         navegador.close()
     servidor.shutdown()

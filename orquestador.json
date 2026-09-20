@@ -73,6 +73,20 @@
       "metadata": {
         "description": "Dónde vive ESTE servicio. No es lo mismo que 'sitio' y confundirlos ya costó un incidente: los enlaces de acceso se armaban sobre el dominio de la página, que solo sirve archivos, y el correo llegaba con un enlace que devolvía el 404 de Azure. /entrar y /revocar son rutas de este contenedor."
       }
+    },
+    "dominiosInternos": {
+      "type": "string",
+      "defaultValue": "startin.org.co",
+      "metadata": {
+        "description": "Dominios de correo (separados por coma) cuyos registros reciben acceso interno: sin cupo de preguntas, sin tope por IP ni por día, y con el panel del equipo. La verificación es el propio enlace de acceso, que solo llega a ese buzón. El tope del mes sí les aplica."
+      }
+    },
+    "versionCache": {
+      "type": "string",
+      "defaultValue": "2",
+      "metadata": {
+        "description": "Etiqueta que entra en la clave de la caché de respuestas. Cambiarla (cualquier texto distinto) invalida la caché entera: se hace al publicar un corte nuevo o tras arreglar un fallo cuyas respuestas quedaron guardadas."
+      }
     }
   },
   "variables": {
@@ -162,6 +176,14 @@
                 {
                   "name": "BRUJULA_API",
                   "value": "[parameters('api')]"
+                },
+                {
+                  "name": "BRUJULA_DOMINIOS_INTERNOS",
+                  "value": "[parameters('dominiosInternos')]"
+                },
+                {
+                  "name": "BRUJULA_VERSION_CACHE",
+                  "value": "[parameters('versionCache')]"
                 }
               ],
               "probes": [

@@ -203,7 +203,7 @@ class AlmacenMemoria:
 
     def __init__(self) -> None:
         self._registros: dict[str, dict] = {}
-        self._acreditados: set[str] = set()
+        self._acreditados: dict[str, dict] = {}
         self.gasto: dict[str, float] = {}      # día -> USD
         self.peticiones: dict[str, list[float]] = {}   # ip -> timestamps
         self.usadas: dict[str, int] = {}       # visitante -> preguntas
@@ -249,14 +249,37 @@ class AlmacenMemoria:
         if ficha in self._registros:
             self._registros[ficha] = {**self._registros[ficha], "usado": True}
 
-    def acreditar(self, visitante: str) -> None:
-        self._acreditados.add(visitante)
+    def acreditar(self, visitante: str, nivel: str = "registrado", correo: str = "") -> None:
+        self._acreditados[visitante] = {"nivel": nivel or "registrado", "correo": correo,
+                                        "desde": time.time()}
+
+    def nivel_de(self, visitante: str) -> str:
+        fila = self._acreditados.get(visitante)
+        return fila.get("nivel", "") if fila else ""
 
     def esta_acreditado(self, visitante: str) -> bool:
-        return visitante in self._acreditados
+        return bool(self.nivel_de(visitante))
 
     def desacreditar(self, visitante: str) -> None:
-        self._acreditados.discard(visitante)
+        self._acreditados.pop(visitante, None)
+
+    def listar_registros(self) -> list[dict]:
+        return [{"ficha": f, **d} for f, d in self._registros.items()]
+
+    def contar_acreditados(self) -> dict[str, int]:
+        cuenta: dict[str, int] = {}
+        for fila in self._acreditados.values():
+            cuenta[fila["nivel"]] = cuenta.get(fila["nivel"], 0) + 1
+        return cuenta
+
+    def gasto_del_mes(self, mes: str) -> float:
+        return sum(v for d, v in self.gasto.items() if d.startswith(mes))
+
+    def consultas_del_dia(self, dia: str) -> int:
+        return self.usadas.get(f"dia|{dia}", 0)
+
+    def sumar_consulta_dia(self, dia: str) -> None:
+        self.usadas[f"dia|{dia}"] = self.usadas.get(f"dia|{dia}", 0) + 1
 
     def leer_cache(self, clave: str) -> dict | None:
         entrada = self.cache.get(clave)
@@ -539,14 +562,53 @@ class AlmacenTablas:
         if datos is not None:
             self.guardar_registro(ficha, {**datos, "usado": True})
 
-    def acreditar(self, visitante: str) -> None:
+    def acreditar(self, visitante: str, nivel: str = "registrado", correo: str = "") -> None:
         self._tabla.upsert_entity({
             "PartitionKey": "acreditado", "RowKey": visitante,
-            "desde": time.time(),
+            "nivel": nivel or "registrado", "correo": correo, "desde": time.time(),
         })
 
+    def nivel_de(self, visitante: str) -> str:
+        fila = self._leer("acreditado", visitante)
+        if not fila:
+            return ""
+        # Las credenciales emitidas antes de que existieran niveles no traen
+        # la columna: cuentan como registradas, que es lo que eran.
+        return str(fila.get("nivel") or "registrado")
+
     def esta_acreditado(self, visitante: str) -> bool:
-        return self._leer("acreditado", visitante) is not None
+        return bool(self.nivel_de(visitante))
+
+    def listar_registros(self) -> list[dict]:
+        salida = []
+        for fila in self._tabla.query_entities("PartitionKey eq 'registro'"):
+            try:
+                datos = json.loads(fila.get("json") or "{}")
+            except ValueError:
+                continue
+            salida.append({"ficha": fila["RowKey"], **datos})
+        return salida
+
+    def contar_acreditados(self) -> dict[str, int]:
+        cuenta: dict[str, int] = {}
+        for fila in self._tabla.query_entities("PartitionKey eq 'acreditado'", select=["nivel"]):
+            nivel = str(fila.get("nivel") or "registrado")
+            cuenta[nivel] = cuenta.get(nivel, 0) + 1
+        return cuenta
+
+    def gasto_del_mes(self, mes: str) -> float:
+        """Todo el mes en una consulta por rango: las claves son AAAA-MM-DD-fragmento."""
+        filtro = (f"PartitionKey eq 'gasto' and RowKey ge '{mes}-01-00' "
+                  f"and RowKey le '{mes}-31-99'")
+        return float(sum(float(f.get("usd", 0.0)) for f in
+                         self._tabla.query_entities(filtro, select=["usd"])))
+
+    def consultas_del_dia(self, dia: str) -> int:
+        fila = self._leer("consultas_dia", dia)
+        return int(fila.get("n", 0)) if fila else 0
+
+    def sumar_consulta_dia(self, dia: str) -> None:
+        self._sumar_atomico("consultas_dia", dia, "n", 1)
 
     def desacreditar(self, visitante: str) -> None:
         try:
@@ -610,6 +672,13 @@ class Portero:
         )
 
     @staticmethod
+    def _seguro(fn, por_defecto):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            return por_defecto
+
+    @staticmethod
     def _hoy() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -659,13 +728,29 @@ class Portero:
             LOG.error("Contador de gasto no disponible: %s", exc)
             return Veredicto(False, "No podemos atender en este momento.", 503)
 
-        if gastado + COSTO_ESTIMADO_USD > self.presupuesto_diario:
+        # El acceso interno (gente de la fundación) no se frena por el día:
+        # una demostración no puede morir a la mitad porque el público gastó la
+        # cuota de la fecha. Lo que NO se salta nadie es el tope del mes, que
+        # es el compromiso duro con el presupuesto de la fundación.
+        if not acceso_completo and gastado + COSTO_ESTIMADO_USD > self.presupuesto_diario:
             return Veredicto(
                 False,
                 "Brújula alcanzó su límite de consultas por hoy. Es una "
                 "herramienta gratuita con un presupuesto acotado. Vuelve mañana, "
                 "o escríbenos a hola@startin.org.co si necesitas acceso continuo "
                 "para un proyecto.",
+                503,
+            )
+        try:
+            gastado_mes = self.almacen.gasto_del_mes(self._hoy()[:7])
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("Contador mensual no disponible: %s", exc)
+            return Veredicto(False, "No podemos atender en este momento.", 503)
+        if gastado_mes + COSTO_ESTIMADO_USD > PRESUPUESTO_MENSUAL_USD:
+            return Veredicto(
+                False,
+                "Brújula agotó su presupuesto del mes. Vuelve el primer día del "
+                "mes siguiente, o escríbenos a hola@startin.org.co.",
                 503,
             )
 
@@ -710,6 +795,7 @@ class Portero:
         self.almacen.sumar_gasto(self._hoy(), usd)
         self.almacen.registrar_peticion(ip)
         self.almacen.sumar_pregunta(visitante)
+        self.almacen.sumar_consulta_dia(self._hoy())
         if not registrado:
             self.almacen.sumar_libre_ip(ip)
         self.almacen.guardar_cache(clave_cache(pregunta, departamento, municipio, sede), respuesta)
@@ -720,6 +806,7 @@ class Portero:
         return {
             "fecha": self._hoy(),
             "presupuesto_mensual_usd": round(PRESUPUESTO_MENSUAL_USD, 2),
+            "gastado_mes_usd": round(self._seguro(lambda: self.almacen.gasto_del_mes(self._hoy()[:7]), 0.0), 4),
             "presupuesto_diario_usd": round(self.presupuesto_diario, 4),
             "gastado_hoy_usd": round(gastado, 4),
             "disponible_hoy_usd": round(max(0.0, self.presupuesto_diario - gastado), 4),

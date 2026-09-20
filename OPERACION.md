@@ -17,12 +17,52 @@ región **East US 2**.
 
 | Recurso | Tipo | Para qué |
 |---|---|---|
-| `stbrujulastartin` | Storage Account (Standard_LRS) | Guarda los cortes de datos |
+| `stbrujulastartin` | Storage Account (Standard_LRS) | Guarda los cortes de datos (blobs) y los contadores del portero (tablas) |
 | `stbrujulastartin/datos` | Contenedor de blobs | `cortes/AAAA-MM-DD/` y `actual/` |
-| `brujula-ingesta` | Container Instance | Corre la ingesta y se apaga |
+| `brujula-ingesta` | Container Instance (y plantilla de Container App **Job** diario en `azure/ingesta_diaria.json`) | Corre la ingesta y se apaga; el script decide solo si toca publicar corte |
+| `brujula-entorno` | Container Apps Environment | Red interna donde viven los dos servicios |
+| `brujula-mcp` | Container App, **ingreso interno** | El servidor MCP: 13 herramientas sobre DuckDB y el corte en Blob. No es alcanzable desde internet |
+| `brujula-orquestador` | Container App, ingreso externo | El agente: FastAPI + modelo de Foundry + portero. Es `acceso.brujula.startinlab.org` |
+| `brujula-educativa-startin` | Azure AI Foundry | El modelo (`gpt-5.4-mini`) con identidad administrada |
+| Static Web App | Sitio estático | Las páginas de `web/`, publicadas por GitHub Actions. Es `brujula.startinlab.org` |
 
 La cuenta de almacenamiento va con TLS 1.2 mínimo y **acceso público
-deshabilitado**: nada de lo que hay ahí se sirve directo a internet.
+deshabilitado**: nada de lo que hay ahí se sirve directo a internet. **No hay
+claves de Storage en ningún lado**: los tres contenedores entran con su identidad
+administrada (lector de blobs el MCP, escritor la ingesta, colaborador de tablas
+el orquestador).
+
+Los dominios están en Hostinger: `brujula` → CNAME a la Static Web App;
+`acceso.brujula` → CNAME al FQDN del orquestador, con el TXT
+`asuid.acceso.brujula` que Container Apps pide para emitir el certificado.
+
+### Cómo se despliega un cambio
+
+Los contenedores **no llevan imagen propia**: al arrancar clonan `main` del
+repositorio e instalan dependencias. Así que desplegar es dos pasos:
+
+1. Subir el archivo al repositorio (Freddy lo hace desde GitHub; la carpeta
+   `web/` la publica sola la acción `publicar-front.yml`).
+2. Para `orquestador.py` o `proxy.py`, forzar una revisión nueva del orquestador
+   para que vuelva a clonar:
+
+   ```bash
+   az containerapp update -g RG_FMC_BRUJULA -n brujula-orquestador \
+     --set-env-vars BRUJULA_DESPLIEGUE=v18        # cualquier valor distinto al anterior
+   ```
+
+   Para `server.py`, lo mismo sobre `brujula-mcp`. Las páginas de `web/` no
+   necesitan nada: la Static Web App las sirve en cuanto la acción termina.
+
+Comprobar que arrancó bien:
+
+```bash
+curl -s https://acceso.brujula.startinlab.org/salud
+# {"estado":"bien","herramientas":13,...}
+```
+
+Si `herramientas` es 0, el orquestador no alcanzó al MCP: mirar los logs con
+`az containerapp logs show -g RG_FMC_BRUJULA -n brujula-orquestador --tail 100`.
 
 ### Qué cuesta
 
@@ -42,6 +82,11 @@ acerca.
 ```bash
 az container start -g RG_FMC_BRUJULA -n brujula-ingesta
 ```
+
+`azure/ingesta_diaria.json` describe la misma ingesta como **Container App Job**
+con disparo diario (`CADA_DIAS` decide cada cuántos días publica corte de
+verdad). Si está desplegado, se lanza a mano con
+`az containerapp job start -g RG_FMC_BRUJULA -n brujula-ingesta`.
 
 El contenedor clona el repositorio, instala dependencias, corre las cuatro
 fuentes, construye las fichas y publica el corte. Tarda alrededor de una hora;
@@ -218,10 +263,11 @@ tope real se arma aquí, en cuatro capas:
 
 | Capa | Qué ataja |
 |---|---|
-| Límite por IP | Un script que dispara cientos de consultas |
+| Límite por IP y hora | Un script que dispara cientos de consultas |
 | Caché | La repetición, que en una herramienta pública es la mayoría del tráfico |
-| Presupuesto diario | El freno duro. Si el día se agota, no se llama al modelo |
-| Preguntas libres | Cuándo se pide registro |
+| Presupuesto diario | Si el día se agota, no se llama al modelo (el acceso interno lo salta) |
+| Presupuesto mensual | El freno duro. Nadie lo salta |
+| Preguntas libres, por navegador y por IP | Cuándo se pide registro |
 
 El orden importa. El límite por IP va primero porque un script vacía el
 presupuesto antes de que la caché se caliente. La caché va antes que la cuota
@@ -279,14 +325,80 @@ real termina sin probarse.
 
 ---
 
+## Niveles de acceso
+
+Quien llega tiene uno de tres niveles, y el portero decide con ellos:
+
+| Nivel | Cómo se obtiene | Qué le aplica |
+|---|---|---|
+| **Libre** | Abrir la página | 10 preguntas por navegador, 25 por conexión (IP) y día, 30 por hora; presupuesto del día |
+| **Registrado** | Formulario + enlace que llega al correo | Sin cupo de preguntas; sigue el tope por hora y el presupuesto del día |
+| **Interno** | Igual que registrado, pero el correo es de un dominio de `BRUJULA_DOMINIOS_INTERNOS` (hoy `startin.org.co`) | Sin cupo, sin tope por hora, sin presupuesto del día. **Sí** el tope del mes |
+
+El nivel se fija **al hacer clic en el enlace del correo**, no al llenar el
+formulario: la única prueba de que alguien es de Startin es que el enlace llegó a
+un buzón `@startin.org.co`. La comparación del dominio es exacta
+(`startin.org.co`, no «termina en startin»), para que `startin.org.co.evil.com`
+no cuele.
+
+El acceso interno existe para las demostraciones: una presentación no puede
+morir porque el público gastó la cuota del día o porque diez personas de la sala
+salen por la misma IP. Lo que **nadie** se salta es el tope mensual de
+`BRUJULA_PRESUPUESTO_MENSUAL_USD` (300): ese es el compromiso con el presupuesto
+de la fundación y está probado (`probar_proxy.py`, prueba 18).
+
+Una credencial acreditada antes de que existieran niveles cuenta como
+**registrada**. Para que un correo de Startin pase a interno hay que registrarse
+otra vez y entrar por el enlace nuevo.
+
+### El panel del equipo
+
+`web/admin.html`, enlazado desde el agente solo para quien entra con nivel
+interno. Muestra registros (nombre, organización, correo, propósito, estado),
+accesos vigentes por nivel, consultas y gasto de los últimos 14 días y el
+presupuesto del mes, y permite revocar un acceso. Lo alimentan dos rutas del
+orquestador:
+
+- `GET /admin/resumen` y `POST /admin/revocar {ficha}`, ambas exigen la cabecera
+  `X-Brujula-Acceso: <credencial>` con nivel interno; cualquier otra cosa recibe
+  403. La credencial **no viaja en la URL**, para que no quede en historiales ni
+  en registros de acceso.
+
+No hay una base de «analítica» aparte: el panel lee los mismos contadores que
+el portero necesita para funcionar. Una herramienta que promete no rastrear a
+nadie no debería tener otra.
+
+### Variables de entorno del orquestador
+
+| Variable | Valor hoy | Para qué |
+|---|---|---|
+| `BRUJULA_MCP_URL` | `https://brujula-mcp.internal…/sse` | Dónde está el MCP (FQDN interno) |
+| `BRUJULA_FOUNDRY_ENDPOINT`, `BRUJULA_MODELO` | Foundry, `gpt-5.4-mini` | El modelo |
+| `BRUJULA_SITIO` | `https://brujula.startinlab.org` | La página; adónde vuelve la gente tras entrar |
+| `BRUJULA_API` | `https://acceso.brujula.startinlab.org` | Este servicio; sobre él se arman los enlaces del correo |
+| `BRUJULA_BUZON` | `brujula@startin.org.co` | Desde dónde salen los correos (Graph, identidad administrada) |
+| `BRUJULA_DOMINIOS_INTERNOS` | `startin.org.co` | Dominios con acceso interno, separados por coma |
+| `BRUJULA_PRESUPUESTO_MENSUAL_USD` | `300` | El tope duro |
+| `BRUJULA_PREGUNTAS_LIBRES`, `BRUJULA_PREGUNTAS_LIBRES_IP_DIA`, `BRUJULA_LIMITE_IP_HORA` | `10`, `25`, `30` | Cupos del nivel libre |
+| `BRUJULA_VERSION_CACHE` | `2` | Cambiarla invalida la caché entera (hacerlo al publicar un corte nuevo) |
+| `BRUJULA_DESPLIEGUE` | `vN` | Sin efecto en el código; cambiarla fuerza una revisión nueva |
+
+Y en el MCP: `BRUJULA_MCP_ANFITRIONES`, la lista de nombres de host con los que
+acepta peticiones (protección contra *DNS rebinding* del SDK). Si el FQDN interno
+cambia, hay que actualizarla o el MCP responde 421.
+
+---
+
 ## Lo que falta
 
-- **Desplegar el servidor MCP.** `server.py` está probado pero todavía no está
-  en Container Apps: hoy solo corre local.
-- **Desplegar el proxy.** El código está probado pero todavía no está en pie.
-- **El front y el dominio** `brujula.startinlab.org` (DNS en Hostinger).
-- **El disparo diario.** El script ya decide solo si le toca trabajar; falta
-  la regla en Azure que arranque el contenedor una vez al día.
+- **Confirmar el disparo diario** (`azure/ingesta_diaria.json` desplegado y con
+  su primera corrida en verde).
+- **Cambiar `BRUJULA_VERSION_CACHE` desde la ingesta** al publicar un corte,
+  para que no dependa de que alguien lo recuerde.
+- **Habitantes y matrícula en la ficha.** Población total (proyecciones DANE) y
+  matrícula por sede (MEN) existen como datos abiertos y caben en la ingesta.
+  Docentes por municipio no tiene fuente nacional abierta; equipos solo como el
+  acumulado histórico de Computadores Para Educar, con su advertencia.
 - **TerriData del DNP**, que es descarga de archivo, no API.
 - **Apagar el acceso elevado en Entra ID**, que sigue activo desde el
   aprovisionamiento.
