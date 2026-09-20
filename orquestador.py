@@ -94,7 +94,7 @@ API_PROPIA = os.environ.get(
 # A dónde llega el aviso de cada registro nuevo. No es una formalidad: una
 # herramienta pública que no sabe a quién le está sirviendo no puede decir que
 # rinde cuentas. Además es el único camino para revocar un acceso.
-AVISOS = os.environ.get("BRUJULA_AVISOS", "hola@startin.org.co")
+AVISOS = os.environ.get("BRUJULA_AVISOS", "portales@startin.org.co")
 # Un enlace de acceso que no vence es una llave tirada en un buzón para siempre.
 HORAS_ENLACE = int(os.environ.get("BRUJULA_HORAS_ENLACE", "72"))
 # Dominios de correo de la casa. Quien confirme un enlace de acceso enviado a

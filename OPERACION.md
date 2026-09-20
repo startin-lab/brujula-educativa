@@ -377,6 +377,7 @@ nadie no debería tener otra.
 | `BRUJULA_SITIO` | `https://brujula.startinlab.org` | La página; adónde vuelve la gente tras entrar |
 | `BRUJULA_API` | `https://acceso.brujula.startinlab.org` | Este servicio; sobre él se arman los enlaces del correo |
 | `BRUJULA_BUZON` | `brujula@startin.org.co` | Desde dónde salen los correos (Graph, identidad administrada) |
+| `BRUJULA_AVISOS` | `portales@startin.org.co` | A dónde llega el aviso de cada registro nuevo, con su enlace de revocación |
 | `BRUJULA_DOMINIOS_INTERNOS` | `startin.org.co` | Dominios con acceso interno, separados por coma |
 | `BRUJULA_PRESUPUESTO_MENSUAL_USD` | `300` | El tope duro |
 | `BRUJULA_PREGUNTAS_LIBRES`, `BRUJULA_PREGUNTAS_LIBRES_IP_DIA`, `BRUJULA_LIMITE_IP_HORA` | `10`, `25`, `30` | Cupos del nivel libre |

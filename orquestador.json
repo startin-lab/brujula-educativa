@@ -1,0 +1,256 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "comentario": "Brújula Educativa — orquestador. Fundación Startin. Recibe la pregunta del front, la pasa por el portero de cuotas, se la da al modelo con las herramientas del MCP y devuelve la respuesta con sus visualizaciones. Sin claves: identidad administrada contra Storage (contadores) y contra Foundry (modelo)."
+  },
+  "parameters": {
+    "cuentaStorage": {
+      "type": "string",
+      "defaultValue": "stbrujulastartin"
+    },
+    "entorno": {
+      "type": "string",
+      "defaultValue": "brujula-entorno"
+    },
+    "region": {
+      "type": "string",
+      "defaultValue": "eastus2"
+    },
+    "repositorio": {
+      "type": "string",
+      "defaultValue": "https://github.com/startin-lab/brujula-educativa.git"
+    },
+    "recursoFoundry": {
+      "type": "string",
+      "defaultValue": "brujula-educativa-startin",
+      "metadata": {
+        "description": "Nombre del recurso de Foundry donde vive el modelo."
+      }
+    },
+    "endpointFoundry": {
+      "type": "string",
+      "defaultValue": "https://brujula-educativa-startin.cognitiveservices.azure.com/"
+    },
+    "modelo": {
+      "type": "string",
+      "defaultValue": "gpt-5.4-mini",
+      "metadata": {
+        "description": "Nombre del despliegue en Foundry, no el del modelo del catálogo."
+      }
+    },
+    "urlMcp": {
+      "type": "string",
+      "defaultValue": "https://brujula-mcp.internal.ambitiousplant-035eb04f.eastus2.azurecontainerapps.io/sse",
+      "metadata": {
+        "description": "Dirección del servidor MCP. Lleva «.internal.» porque el MCP tiene ingreso interno: solo las apps del mismo entorno lo alcanzan. Si algún día se recrea el entorno, cambia el sufijo aleatorio y hay que actualizar esto (y BRUJULA_MCP_ANFITRIONES en el MCP)."
+      }
+    },
+    "origenes": {
+      "type": "string",
+      "defaultValue": "https://brujula.startinlab.org",
+      "metadata": {
+        "description": "Quién puede llamar al orquestador desde un navegador. Un comodín aquí dejaría que cualquier página gaste el presupuesto de la fundación."
+      }
+    },
+    "buzon": {
+      "type": "string",
+      "defaultValue": "brujula@startin.org.co",
+      "metadata": {
+        "description": "Buzón desde el que salen los enlaces de acceso. La identidad del orquestador debe tener permiso de envío restringido a él."
+      }
+    },
+    "sitio": {
+      "type": "string",
+      "defaultValue": "https://brujula.startinlab.org",
+      "metadata": {
+        "description": "Dónde vive la PÁGINA (la Static Web App). Se usa para mandar de vuelta al visitante después de entrar."
+      }
+    },
+    "api": {
+      "type": "string",
+      "defaultValue": "https://acceso.brujula.startinlab.org",
+      "metadata": {
+        "description": "Dónde vive ESTE servicio. No es lo mismo que 'sitio' y confundirlos ya costó un incidente: los enlaces de acceso se armaban sobre el dominio de la página, que solo sirve archivos, y el correo llegaba con un enlace que devolvía el 404 de Azure. /entrar y /revocar son rutas de este contenedor."
+      }
+    },
+    "avisos": {
+      "type": "string",
+      "defaultValue": "portales@startin.org.co",
+      "metadata": {
+        "description": "Buzón del equipo que recibe el aviso de cada registro nuevo, con el enlace de revocación. Es distinto del buzón remitente (buzon)."
+      }
+    },
+    "dominiosInternos": {
+      "type": "string",
+      "defaultValue": "startin.org.co",
+      "metadata": {
+        "description": "Dominios de correo (separados por coma) cuyos registros reciben acceso interno: sin cupo de preguntas, sin tope por IP ni por día, y con el panel del equipo. La verificación es el propio enlace de acceso, que solo llega a ese buzón. El tope del mes sí les aplica."
+      }
+    },
+    "versionCache": {
+      "type": "string",
+      "defaultValue": "2",
+      "metadata": {
+        "description": "Etiqueta que entra en la clave de la caché de respuestas. Cambiarla (cualquier texto distinto) invalida la caché entera: se hace al publicar un corte nuevo o tras arreglar un fallo cuyas respuestas quedaron guardadas."
+      }
+    }
+  },
+  "variables": {
+    "app": "brujula-orquestador",
+    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; pip install --no-cache-dir --quiet fastapi uvicorn \"mcp<2\" openai azure-identity azure-data-tables; exec uvicorn orquestador:app --host 0.0.0.0 --port 8000",
+    "_nota_version_mcp": "Por qué 'mcp<2' y no 'mcp' a secas: el 19 de septiembre de 2026 el SDK sacó la versión 2, que renombró FastMCP a MCPServer. El arranque instalaba la última versión disponible, así que el contenedor se cayó al reiniciarse —con el corte ya descargado y validado— por un cambio de biblioteca que nadie de este lado pidió. Un despliegue que se reconstruye en cada arranque hereda las decisiones de versión de terceros; fijar el mayor es lo que convierte eso en una decisión nuestra. Cuando migremos al API de la 2, se sube el tope aquí, a propósito y habiéndolo probado."
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('app')]",
+      "location": "[parameters('region')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('entorno'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": true,
+            "targetPort": 8000,
+            "transport": "auto",
+            "allowInsecure": false,
+            "traffic": [
+              {
+                "latestRevision": true,
+                "weight": 100
+              }
+            ]
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "orquestador",
+              "image": "mcr.microsoft.com/devcontainers/python:3.12",
+              "command": [
+                "/bin/bash",
+                "-lc"
+              ],
+              "args": [
+                "[variables('arranque')]"
+              ],
+              "resources": {
+                "cpu": 0.5,
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "REPO",
+                  "value": "[parameters('repositorio')]"
+                },
+                {
+                  "name": "BRUJULA_MCP_URL",
+                  "value": "[parameters('urlMcp')]"
+                },
+                {
+                  "name": "BRUJULA_FOUNDRY_ENDPOINT",
+                  "value": "[parameters('endpointFoundry')]"
+                },
+                {
+                  "name": "BRUJULA_MODELO",
+                  "value": "[parameters('modelo')]"
+                },
+                {
+                  "name": "BRUJULA_ORIGENES",
+                  "value": "[parameters('origenes')]"
+                },
+                {
+                  "name": "AZURE_STORAGE_CUENTA",
+                  "value": "[parameters('cuentaStorage')]"
+                },
+                {
+                  "name": "BRUJULA_PRESUPUESTO_MENSUAL_USD",
+                  "value": "300"
+                },
+                {
+                  "name": "BRUJULA_BUZON",
+                  "value": "[parameters('buzon')]"
+                },
+                {
+                  "name": "BRUJULA_SITIO",
+                  "value": "[parameters('sitio')]"
+                },
+                {
+                  "name": "BRUJULA_API",
+                  "value": "[parameters('api')]"
+                },
+                {
+                  "name": "BRUJULA_AVISOS",
+                  "value": "[parameters('avisos')]"
+                },
+                {
+                  "name": "BRUJULA_DOMINIOS_INTERNOS",
+                  "value": "[parameters('dominiosInternos')]"
+                },
+                {
+                  "name": "BRUJULA_VERSION_CACHE",
+                  "value": "[parameters('versionCache')]"
+                }
+              ],
+              "probes": [
+                {
+                  "type": "Startup",
+                  "httpGet": {
+                    "path": "/salud",
+                    "port": 8000
+                  },
+                  "initialDelaySeconds": 30,
+                  "periodSeconds": 10,
+                  "failureThreshold": 60
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 3
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('app'), 'tablas')]",
+      "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('cuentaStorage'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('app'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, variables('app'), 'modelo')]",
+      "scope": "[concat('Microsoft.CognitiveServices/accounts/', parameters('recursoFoundry'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', variables('app'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01', 'Full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "url": {
+      "type": "string",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', variables('app')), '2024-03-01').configuration.ingress.fqdn)]"
+    }
+  }
+}
