@@ -36,13 +36,21 @@
       "metadata": {
         "description": "Región del servidor. Debe ser la misma de la cuenta de Storage: bajar el corte no debería cruzar regiones."
       }
+    },
+    "anfitriones": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Dominios que este servidor acepta en la cabecera Host, separados por comas. El SDK trae protección contra DNS rebinding encendida y con lista vacía: sin esto el contenedor arranca bien, carga las fichas y contesta 421 a todo. Van el dominio del contenedor y, si se pasa a ingreso interno, también el que lleva «.internal.»."
+      }
     }
   },
   "variables": {
     "workspace": "[concat(parameters('prefijo'), '-logs')]",
     "entorno": "[concat(parameters('prefijo'), '-entorno')]",
     "app": "[concat(parameters('prefijo'), '-mcp')]",
-    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; pip install --no-cache-dir --quiet mcp duckdb azure-storage-blob azure-identity; exec bash arrancar_servidor.sh"
+    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; pip install --no-cache-dir --quiet \"mcp<2\" duckdb azure-storage-blob azure-identity; exec bash arrancar_servidor.sh",
+    "_nota_version_mcp": "Por qué 'mcp<2' y no 'mcp' a secas: el 19 de septiembre de 2026 el SDK sacó la versión 2, que renombró FastMCP a MCPServer. El arranque instalaba la última versión disponible, así que el contenedor se cayó al reiniciarse —con el corte ya descargado y validado— por un cambio de biblioteca que nadie de este lado pidió. Un despliegue que se reconstruye en cada arranque hereda las decisiones de versión de terceros; fijar el mayor es lo que convierte eso en una decisión nuestra. Cuando migremos al API de la 2, se sube el tope aquí, a propósito y habiéndolo probado."
   },
   "resources": [
     {
@@ -142,6 +150,10 @@
                 {
                   "name": "PUERTO",
                   "value": "8080"
+                },
+                {
+                  "name": "BRUJULA_MCP_ANFITRIONES",
+                  "value": "[parameters('anfitriones')]"
                 }
               ],
               "probes": [

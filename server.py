@@ -69,6 +69,7 @@ from typing import Any
 
 import duckdb
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 LOG = logging.getLogger("brujula")
 
@@ -152,7 +153,44 @@ AVISO_SECOP = (
     "como inversión educativa del territorio."
 )
 
-mcp = FastMCP("brujula-educativa")
+def _seguridad_de_transporte() -> TransportSecuritySettings:
+    """
+    Qué dominios puede llevar la cabecera Host de una petición a este servidor.
+
+    El SDK trae protección contra DNS rebinding —un ataque en el que una página
+    cualquiera hace que el navegador de la víctima resuelva un dominio propio
+    hacia una dirección interna y hable con un servicio que jamás debió ser
+    alcanzable desde fuera—. Está bien que venga encendida.
+
+    Lo que no está bien es descubrirlo en producción: la lista por defecto no
+    incluye ningún dominio, así que el servidor arrancó perfecto, cargó las
+    fichas, dijo «MCP escuchando» y respondió 421 «Invalid Host header» a todo
+    lo que le llegó. Desde afuera parecía un servidor sano que no servía.
+
+    Va por variable de entorno y no en el código a propósito: el nombre del
+    contenedor cambia cuando se pasa a ingreso interno o se recrea el entorno,
+    y ese día no queremos tener que tocar este archivo.
+    """
+    anfitriones = [h.strip() for h in
+                   os.environ.get("BRUJULA_MCP_ANFITRIONES", "").split(",") if h.strip()]
+    if not anfitriones:
+        # Sin lista, solo la máquina local: es lo que sirve para desarrollo y
+        # lo único seguro de suponer.
+        return TransportSecuritySettings(
+            allowed_hosts=["localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
+            allowed_origins=["http://localhost", "http://localhost:*",
+                             "http://127.0.0.1", "http://127.0.0.1:*"],
+        )
+    permitidos = anfitriones + [f"{h}:*" for h in anfitriones] + \
+                 ["localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"]
+    return TransportSecuritySettings(
+        allowed_hosts=permitidos,
+        allowed_origins=[f"https://{h}" for h in anfitriones] +
+                        [f"http://{h}" for h in anfitriones],
+    )
+
+
+mcp = FastMCP("brujula-educativa", transport_security=_seguridad_de_transporte())
 _con: duckdb.DuckDBPyConnection | None = None
 _datos: Path = Path("./data")
 _meta: dict[str, Any] = {}
