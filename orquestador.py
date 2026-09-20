@@ -62,6 +62,8 @@ Variables:
 import json
 import logging
 import os
+import secrets
+import time
 from typing import Any
 
 LOG = logging.getLogger("brujula.orquestador")
@@ -415,7 +417,7 @@ def crear_app():
     from fastapi import FastAPI, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
-    from pydantic import BaseModel, EmailStr, Field
+    from pydantic import BaseModel, Field
 
     import proxy
 
@@ -428,7 +430,14 @@ def crear_app():
     class Registro(BaseModel):
         nombre: str = Field(min_length=2, max_length=80)
         organizacion: str = Field(min_length=2, max_length=120)
-        correo: EmailStr
+        # Se valida con un patrón y no con EmailStr de Pydantic. EmailStr
+        # arrastra el paquete email-validator, y su ausencia no se nota al
+        # importar: revienta al construir el esquema, con el contenedor ya
+        # arrancando. Eso dejó una revisión entera sin levantar. Para lo que
+        # necesitamos —descartar erratas antes de gastar un envío— basta esto;
+        # la validación de verdad la hace el servidor de correo al entregar.
+        correo: str = Field(min_length=5, max_length=120,
+                            pattern=r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
         proposito: str = Field(min_length=10, max_length=400)
         autoriza: bool = False
         politica: str = ""
@@ -552,7 +561,7 @@ def crear_app():
             portero.almacen.guardar_registro(ficha, {
                 "nombre": datos.nombre,
                 "organizacion": datos.organizacion,
-                "correo": str(datos.correo),
+                "correo": datos.correo,
                 "proposito": datos.proposito,
                 "autoriza": True,
                 "politica": datos.politica or "https://startin.org.co/privacidad/",
@@ -569,7 +578,7 @@ def crear_app():
         enlace = f"{SITIO}/entrar?t={ficha}"
         try:
             enviar_correo(
-                str(datos.correo),
+                datos.correo,
                 "Tu acceso a Brújula Educativa",
                 correo_de_acceso(datos.nombre, enlace),
             )

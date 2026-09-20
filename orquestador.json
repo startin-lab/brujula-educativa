@@ -67,7 +67,7 @@
   },
   "variables": {
     "app": "brujula-orquestador",
-    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; pip install --no-cache-dir --quiet fastapi uvicorn mcp openai azure-identity azure-data-tables email-validator; exec uvicorn orquestador:app --host 0.0.0.0 --port 8000"
+    "arranque": "set -e; rm -rf /app/src; git clone --depth 1 $REPO /app/src; cd /app/src; pip install --no-cache-dir --quiet fastapi uvicorn mcp openai azure-identity azure-data-tables; exec uvicorn orquestador:app --host 0.0.0.0 --port 8000"
   },
   "resources": [
     {
