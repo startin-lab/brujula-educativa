@@ -151,8 +151,11 @@ class ModeloSimulado:
         # Lee el ámbito que le manda el orquestador, como haría el modelo real.
         ambito = next((m["content"] for m in mensajes if m.get("role") == "system"
                        and str(m.get("content", "")).startswith("Ámbito")), "")
+        pregunta = next((m["content"] for m in reversed(mensajes) if m.get("role") == "user"), "")
         if not ya_llamo:
-            if "país entero" in ambito:
+            if "prensa" in pregunta:
+                nombre, args = "titulares_recientes", {"departamento": "TOLIMA", "municipio": "Armero"}
+            elif "país entero" in ambito:
                 nombre, args = "ficha_pais", {}
             elif "DEPARTAMENTO como un todo" in ambito:
                 nombre, args = "ficha_departamento", {"departamento": "CUNDINAMARCA"}
@@ -213,6 +216,16 @@ def _comprobar() -> int:
     # haría la persona que lo recibe.
     correos: list[tuple[str, str, str]] = []
     orquestador.enviar_correo = lambda dest, asunto, html: correos.append((dest, asunto, html))
+    # La prensa no se consulta de verdad en la prueba: se simula el RSS.
+    RSS = ('<rss><channel><item><title>Paro en Instituto Armero: estudiantes exigen rector - Pulzo</title>'
+           '<link>https://news.google.com/rss/articles/x</link><pubDate>Wed, 16 Sep 2026 14:15:47 GMT</pubDate>'
+           '<source url="https://pulzo.com">Pulzo</source></item></channel></rss>')
+    pedidas_prensa: list[str] = []
+
+    async def rss_falso(url):
+        pedidas_prensa.append(url)
+        return RSS
+    orquestador.traer_rss = rss_falso
 
     from fastapi.testclient import TestClient
 
@@ -226,7 +239,7 @@ def _comprobar() -> int:
     with TestClient(orquestador.crear_app()) as cliente:
         print("\n== 1. El orquestador ve el catálogo del MCP ==")
         salud = cliente.get("/salud").json()
-        ok(salud["herramientas"] == 6, "el catálogo llegó completo")
+        ok(salud["herramientas"] == 7, "el catálogo llegó completo (6 del MCP + titulares)")
         ok(salud["consultas"] == "abiertas", "las consultas quedan abiertas")
 
         print("\n== 2. Una pregunta cruza entera ==")
@@ -303,6 +316,28 @@ def _comprobar() -> int:
            "/pais responde y respeta el indicador pedido")
         ok(cliente.get("/estado", params={"v": "visitante-4"}).json().get("restantes") == 8,
            "las dos preguntas gastaron cupo; las lecturas no")
+
+        print("\n== 4d. Actualidad: titulares tal cual, por el agente y por la página ==")
+        salud = cliente.get("/salud").json()
+        ok(salud["herramientas"] == 7, f"el catálogo suma la herramienta local de titulares ({salud['herramientas']})")
+        rt = cliente.post("/preguntar", json={"pregunta": "¿qué dice la prensa?", "departamento": "TOLIMA",
+                                              "municipio": "Armero", "visitante": "visitante-5"})
+        ok(rt.status_code == 200 and modelo.ultima_herramienta == "titulares_recientes", "el modelo puede pedir titulares_recientes")
+        herramienta_msg = next((m for m in modelo.visto[-1] if m.get("role") == "tool"), None)
+        contenido = json.loads(herramienta_msg["content"]) if herramienta_msg else {}
+        ok(contenido.get("encontrado") is True and contenido["titulares"][0]["medio"] == "Pulzo"
+           and contenido["titulares"][0]["fecha"] == "2026-09-16", "y recibe titular, medio y fecha, sin el sufijo del medio")
+        ok(pedidas_prensa and "Armero" in pedidas_prensa[-1] and "when%3A90d" in pedidas_prensa[-1],
+           "la consulta a la prensa acota al municipio y a 90 días")
+        ok(any("no verifica ni resume" in a for a in rt.json().get("advertencias", [])),
+           "la advertencia de prensa llega a la respuesta")
+        n = len(pedidas_prensa)
+        a1 = cliente.get("/actualidad", params={"departamento": "TOLIMA", "municipio": "Armero"})
+        ok(a1.status_code == 200 and a1.json()["titulares"][0]["titulo"].startswith("Paro en Instituto"),
+           "/actualidad sirve los titulares a la página")
+        ok(len(pedidas_prensa) == n, "y la segunda vez sale de la caché, sin volver a la prensa")
+        ok(cliente.get("/estado", params={"v": "visitante-5"}).json().get("restantes") == 9,
+           "la lectura de actualidad no gasta cupo; la pregunta sí")
 
         print("\n== 5. El registro sigue vivo aunque no haya modelo ==")
         r3 = cliente.post("/registrar", json={

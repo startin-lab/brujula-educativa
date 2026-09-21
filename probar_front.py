@@ -89,6 +89,11 @@ DEPARTAMENTO = {
         {"municipio": "Sin coordenada", "cod_municipio": "52999", "lat": None, "lon": None, "valor": None, "senales": 0, "habitantes": None, "matricula": None},
     ],
 }
+ACTUALIDAD = {"encontrado": True, "ambito": "San Andres de Tumaco", "dias": 90, "fuente": "Google Noticias (RSS)",
+    "advertencia": "Titulares de prensa tomados tal cual. Brújula no verifica ni resume su contenido.",
+    "titulares": [
+        {"titulo": "Estudiantes de Tumaco exigen nuevo rector", "medio": "Pulzo", "fecha": "2026-09-16", "enlace": "https://news.google.com/rss/articles/a"},
+        {"titulo": "Secretaría anuncia obras en dos colegios <script>", "medio": "El Nuevo Día", "fecha": "2026-08-20", "enlace": "https://news.google.com/rss/articles/b"}]}
 COLEGIOS = {"encontrado": True, "sedes": [
     {"cod": "152835000011", "nombre": "IE Ciudadela Tumac", "naturaleza": "OFICIAL", "zona": "URBANO", "evaluados": 120},
     {"cod": "152835000022", "nombre": "IE Robert Mario Bischoff", "naturaleza": "OFICIAL", "zona": "URBANO", "evaluados": 88},
@@ -156,7 +161,9 @@ def main() -> int:
                 try: enviados.append(json.loads(request.post_data or "{}"))
                 except Exception: pass
             cuerpo = None
-            if url.startswith(f"{API}/pais"):
+            if url.startswith(f"{API}/actualidad"):
+                cuerpo = ACTUALIDAD
+            elif url.startswith(f"{API}/pais"):
                 pedidos_pais.append(url); cuerpo = PAIS
             elif url.startswith(f"{API}/departamento"): cuerpo = DEPARTAMENTO
             elif url.startswith(f"{API}/territorios"): cuerpo = TERRITORIOS
@@ -257,6 +264,13 @@ def main() -> int:
            "27,0 %" in pagina.inner_text("#inicio .tabla-eco"),
            "la economía va en tabla: actividad y % del PIB")
         ok("6,2" in inicio and "Estudiantes por computador · CPE 2019" in inicio, "estudiantes por computador con su año de CPE")
+        pagina.wait_for_selector("#actualidad li", timeout=5000)
+        act = pagina.inner_text("#actualidad")
+        ok("exigen nuevo rector" in act and "Pulzo" in act and "16/09/2026" in act, "la actualidad lista titulares con medio y fecha")
+        ok(pagina.eval_on_selector_all("#actualidad li a[target=_blank][rel*=nofollow]", "e => e.length") == 2,
+           "cada titular es un enlace externo")
+        ok("<script" not in pagina.inner_html("#actualidad"), "un titular malicioso no se cuela como HTML")
+        ok("no verifica ni resume" in act, "y el aviso de que Brújula no verifica ni resume va pegado")
         ok("2 señales" in inicio, "cuántas señales hay, sin decir cuáles todavía")
         ok(pagina.eval_on_selector_all("#inicio svg g.principal path.dpto", "e => e.length") == 32,
            "el mapa dibuja los 32 departamentos continentales")

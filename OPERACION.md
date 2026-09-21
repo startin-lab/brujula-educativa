@@ -345,6 +345,20 @@ El orquestador expone `/pais?indicador=` y `/departamento?departamento=&indicado
 (lectura, caché de 6 h, sin cupo). `ranking_nacional` ya no exige token: la
 fundación abrió el país a todo el mundo; el freno es el presupuesto mensual.
 
+## Actualidad: titulares de prensa
+
+El orquestador consulta el RSS de Google Noticias acotado al territorio, a
+educación y a los últimos 90 días, y devuelve **titulares con medio, fecha y
+enlace**, tal cual (`/actualidad`, y la herramienta local `titulares_recientes`
+para el agente). Caché de 6 h en memoria; sin llave ni costo.
+
+La regla, acordada con la fundación el 20/09/2026: Brújula **no lee, no resume
+y no interpreta** los artículos. El modelo tiene instrucción explícita de citar
+titulares como titulares y de no afirmar corrupción, irregularidad ni mala
+gestión a partir de uno. Si Google cambia o bloquea el RSS, el bloque dice «no
+se pudo consultar la prensa» y todo lo demás sigue; `BRUJULA_ACTUALIDAD=0` lo
+apaga sin tocar código.
+
 ## Niveles de acceso
 
 Quien llega tiene uno de tres niveles, y el portero decide con ellos:
@@ -401,7 +415,8 @@ nadie no debería tener otra.
 | `BRUJULA_DOMINIOS_INTERNOS` | `startin.org.co` | Dominios con acceso interno, separados por coma |
 | `BRUJULA_PRESUPUESTO_MENSUAL_USD` | `300` | El tope duro |
 | `BRUJULA_PREGUNTAS_LIBRES`, `BRUJULA_PREGUNTAS_LIBRES_IP_DIA`, `BRUJULA_LIMITE_IP_HORA` | `10`, `25`, `30` | Cupos del nivel libre |
-| `BRUJULA_VERSION_CACHE` | `2` | Cambiarla invalida la caché entera (hacerlo al publicar un corte nuevo) |
+| `BRUJULA_VERSION_CACHE` | `5` | Cambiarla invalida la caché entera (hacerlo al publicar un corte nuevo) |
+| `BRUJULA_ACTUALIDAD`, `BRUJULA_ACTUALIDAD_DIAS`, `BRUJULA_ACTUALIDAD_MAX` | `1`, `90`, `6` | Titulares de prensa (Google Noticias RSS): apagar con `0`; ventana en días; cuántos se muestran |
 | `BRUJULA_DESPLIEGUE` | `vN` | Sin efecto en el código; cambiarla fuerza una revisión nueva |
 
 Y en el MCP: `BRUJULA_MCP_ANFITRIONES`, la lista de nombres de host con los que

@@ -149,6 +149,10 @@ CÓMO TRABAJAS
   ahí vale la pena pedir documentos.
 - Si hay varios lugares con el mismo nombre, pregunta cuál antes de seguir.
   Mandar un diagnóstico al municipio equivocado es peor que preguntar.
+- Los titulares de prensa (titulares_recientes) se citan como titulares: medio,
+  fecha y enlace. No has leído los artículos: no resumas su contenido ni
+  concluyas nada de ellos, y jamás afirmes corrupción, irregularidad o mala
+  gestión a partir de un titular.
 
 CÓMO ESCRIBES
 
@@ -158,6 +162,142 @@ CÓMO ESCRIBES
   significan los números y qué no se puede concluir de ellos.
 - Di siempre de qué año es cada cifra cuando el año importe.
 """
+
+
+# --------------------------------------------------------------------- #
+#  Actualidad: titulares de prensa por territorio
+# --------------------------------------------------------------------- #
+#
+# Lo que la fundación pidió el 20/09/2026: que al elegir un municipio se vea
+# qué se ha publicado sobre él recientemente. Y el límite que se acordó al
+# mismo tiempo: Brújula MUESTRA titulares con medio, fecha y enlace; NO lee
+# los artículos, NO los resume y NO concluye nada a partir de ellos. Un
+# titular relayado tal cual es dato de un tercero, marcado como tal. Un
+# resumen hecho por el modelo sería una afirmación de Brújula, y de ahí a
+# una rectificación hay un paso.
+#
+# La fuente es el RSS de Google Noticias (probado desde Azure el 20/09/2026:
+# responde en un segundo, sin llave, con medio y fecha por titular). Se
+# acota a educación y a los últimos 90 días con los operadores del buscador.
+
+ACTUALIDAD_DIAS = int(os.environ.get("BRUJULA_ACTUALIDAD_DIAS", "90"))
+ACTUALIDAD_MAX = int(os.environ.get("BRUJULA_ACTUALIDAD_MAX", "6"))
+ACTUALIDAD_TTL = 6 * 3600
+ACTUALIDAD_ACTIVA = os.environ.get("BRUJULA_ACTUALIDAD", "1") != "0"
+TERMINOS_EDUCACION = ('(educación OR colegio OR colegios OR escuela OR estudiantes OR docentes '
+                      'OR rector OR "institución educativa" OR "alimentación escolar" OR PAE '
+                      'OR "secretaría de educación" OR ICFES)')
+AVISO_ACTUALIDAD = (
+    "Titulares de prensa tomados tal cual de Google Noticias, con su medio y su fecha. "
+    "Brújula no verifica ni resume su contenido: son referencias para ir a la fuente, "
+    "no hallazgos."
+)
+HERRAMIENTA_ACTUALIDAD = {
+    "type": "function",
+    "function": {
+        "name": "titulares_recientes",
+        "description": (
+            "Titulares de prensa de los últimos 90 días sobre educación en un municipio, "
+            "un departamento o el país, con medio, fecha y enlace. Úsala cuando pregunten "
+            "qué ha pasado, qué se ha publicado o qué noticias hay. Cítalos como lo que "
+            "son: titulares de un medio en una fecha, con enlace. NO resumas ni afirmes "
+            "el contenido del artículo: no lo has leído. Nunca digas que hubo corrupción, "
+            "irregularidad o mala gestión a partir de un titular."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "departamento": {"type": "string", "description": "Departamento (vacío = país)."},
+                "municipio": {"type": "string", "description": "Municipio (vacío = departamento entero)."},
+            },
+        },
+    },
+}
+_actualidad_cache: dict[str, dict[str, Any]] = {}
+
+
+def _nombre_llano(texto: str) -> str:
+    """«BOGOTÁ, D.C.» → «Bogotá»: como lo escribe la prensa. Quita el sufijo D.C.
+    y pasa a mayúscula inicial lo que venga en mayúscula sostenida."""
+    import re
+    t = re.sub(r",?\s*D\.?\s*C\.?$", "", (texto or "").strip(), flags=re.I)
+    if t and t == t.upper():
+        t = t.title().replace(" De ", " de ").replace(" Del ", " del ").replace(" Y ", " y ")
+    return t
+
+
+def _consulta_prensa(departamento: str, municipio: str) -> str:
+    dep, mun = _nombre_llano(departamento), _nombre_llano(municipio)
+    if mun:
+        lugar = f'"{mun}" {dep}'.strip()
+    elif dep:
+        lugar = f'"{dep}" Colombia'
+    else:
+        lugar = 'Colombia "Ministerio de Educación"'
+    return f"{lugar} {TERMINOS_EDUCACION} when:{ACTUALIDAD_DIAS}d"
+
+
+def _leer_rss(xml: str) -> list[dict[str, Any]]:
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    salida = []
+    for item in ET.fromstring(xml).iter("item"):
+        titulo = (item.findtext("title") or "").strip()
+        medio_el = item.find("source")
+        medio = (medio_el.text or "").strip() if medio_el is not None else ""
+        # Google pone « - Medio» al final del título; se quita porque el medio va aparte.
+        if medio and titulo.endswith(f" - {medio}"):
+            titulo = titulo[: -len(medio) - 3].strip()
+        fecha = ""
+        try:
+            fecha = parsedate_to_datetime(item.findtext("pubDate") or "").date().isoformat()
+        except Exception:  # noqa: BLE001
+            pass
+        enlace = (item.findtext("link") or "").strip()
+        if titulo and enlace:
+            salida.append({"titulo": titulo, "medio": medio, "fecha": fecha, "enlace": enlace})
+    salida.sort(key=lambda x: x["fecha"], reverse=True)
+    return salida
+
+
+async def traer_rss(url: str) -> str:
+    """El único punto que sale a la prensa. Separado para poder simularlo en pruebas."""
+    import httpx
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True,
+                                 headers={"User-Agent": "BrujulaEducativa/1.0 (+https://brujula.startinlab.org)"}) as cliente:
+        r = await cliente.get(url)
+        r.raise_for_status()
+        return r.text
+
+
+async def actualidad(departamento: str = "", municipio: str = "") -> dict[str, Any]:
+    """Titulares recientes sobre educación en el ámbito dado. Cacheado 6 h."""
+    ambito = municipio or departamento or "Colombia"
+    base = {"ambito": ambito, "dias": ACTUALIDAD_DIAS, "fuente": "Google Noticias (RSS)",
+            "advertencia": AVISO_ACTUALIDAD, "advertencias": [AVISO_ACTUALIDAD]}
+    if not ACTUALIDAD_ACTIVA:
+        return {**base, "encontrado": False, "titulares": [], "motivo": "La actualidad está apagada."}
+    clave = f"{departamento.casefold()}|{municipio.casefold()}"
+    guardado = _actualidad_cache.get(clave)
+    if guardado and time.time() - guardado["cuando"] < ACTUALIDAD_TTL:
+        return guardado["datos"]
+
+    import urllib.parse
+    url = ("https://news.google.com/rss/search?q=" + urllib.parse.quote(_consulta_prensa(departamento, municipio))
+           + "&hl=es-419&gl=CO&ceid=CO:es-419")
+    try:
+        titulares = _leer_rss(await traer_rss(url))[:ACTUALIDAD_MAX]
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Actualidad no disponible para %s: %s", ambito, str(exc)[:120])
+        return {**base, "encontrado": False, "titulares": [],
+                "motivo": "No se pudo consultar la prensa en este momento."}
+
+    datos = {**base, "encontrado": True, "titulares": titulares,
+             "consultado": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if len(_actualidad_cache) > 2000:
+        _actualidad_cache.clear()
+    _actualidad_cache[clave] = {"datos": datos, "cuando": time.time()}
+    return datos
 
 
 # --------------------------------------------------------------------- #
@@ -223,8 +363,8 @@ class Herramientas:
         """Pide el catálogo. No deja nada abierto."""
         async with self.sesion() as ses:
             listado = await ses.list_tools()
-            self._catalogo = [_esquema_a_openai(h) for h in listado.tools]
-        LOG.info("MCP responde: %s herramientas", len(self._catalogo))
+            self._catalogo = [_esquema_a_openai(h) for h in listado.tools] + [HERRAMIENTA_ACTUALIDAD]
+        LOG.info("MCP responde: %s herramientas (+1 local de actualidad)", len(self._catalogo) - 1)
 
     async def reintentar(self) -> bool:
         """Vuelve a pedir el catálogo si quedó vacío porque el MCP no estaba.
@@ -281,15 +421,12 @@ class Herramientas:
         Ejecuta una herramienta. Aquí se aplica la única regla de acceso que el
         modelo no puede saltarse: el país entero.
         """
-        if nombre == "ranking_nacional":
-            if not acceso_completo or not TOKEN_NACIONAL:
-                return {
-                    "encontrado": False,
-                    "motivo": "Las consultas de país entero requieren acceso "
-                              "completo. Responde sobre un departamento.",
-                }
-            # El token lo pone el orquestador, no el modelo.
-            argumentos = {**argumentos, "token": TOKEN_NACIONAL}
+        # El país entero está abierto a todo el mundo desde el 20/09/2026; la
+        # reja que había aquí se quitó. El freno del gasto es el portero.
+        if nombre == HERRAMIENTA_ACTUALIDAD["function"]["name"]:
+            # Herramienta local: no pasa por el MCP, sale a la prensa.
+            return await actualidad(str(argumentos.get("departamento", "")),
+                                    str(argumentos.get("municipio", "")))
 
         try:
             resultado = await sesion.call_tool(nombre, argumentos)
@@ -831,6 +968,12 @@ def crear_app():
             lecturas[clave] = {"datos": datos, "cuando": time.time()}
         return JSONResponse(datos, status_code=200 if datos.get("encontrado") else 404,
                             headers={"cache-control": "public, max-age=1800"})
+
+    @app.get("/actualidad")
+    async def actualidad_(departamento: str = "", municipio: str = ""):
+        """Titulares recientes para el bloque de actualidad de la ficha. Sin modelo, sin cupo."""
+        datos = await actualidad(departamento.strip(), municipio.strip())
+        return JSONResponse(datos, headers={"cache-control": "public, max-age=1800"})
 
     @app.get("/departamento")
     async def departamento_(departamento: str = "", indicador: str = "cobertura_neta"):
