@@ -129,6 +129,10 @@ WITH base AS (
            repitencia, tasa_matriculacion, poblacion_5_16, desercion_sospechosa
     FROM men
     WHERE cod_municipio IS NOT NULL
+      -- La fila «NACIONAL» (código de departamento 00) no es un municipio:
+      -- trae la población del país entero y arruina cualquier ponderación.
+      AND COALESCE(cod_departamento, '') <> '00'
+      AND strip_accents(upper(COALESCE(municipio, ''))) <> 'NACIONAL'
 )
 SELECT
     cod_municipio,

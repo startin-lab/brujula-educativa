@@ -87,6 +87,14 @@ def generar(destino: Path) -> None:
                 tasa_matriculacion=float(rng.uniform(70, 99)),
                 poblacion_5_16=int(rng.integers(500, 90000)),
             ))
+    # La fila «NACIONAL» que el MEN mete entre los municipios: código 0,
+    # población de todo el país y una cobertura que no es porcentaje. Si se
+    # cuela, la cobertura ponderada del país se derrumba.
+    for anio in range(2011, 2025):
+        filas.append(dict(anio=anio, cod_municipio="0", municipio="NACIONAL", departamento="NACIONAL",
+                          cod_departamento="0", cobertura_neta=0.9, cobertura_bruta=1.0, desercion=0.0,
+                          aprobacion=0.9, reprobacion=0.05, repitencia=0.02, tasa_matriculacion=0.9,
+                          poblacion_5_16=10_000_000))
     men = pd.DataFrame(filas)
     men["anio"] = men["anio"].astype("Int64")
     men["cod_municipio"] = men["cod_municipio"].astype("string")   # sin rellenar
@@ -473,8 +481,12 @@ def main() -> int:
               and fd["equipos"]["estudiantes_por_computador"] is not None, fd.get("equipos"))
 
         fp_ = llamar(S.ficha_pais)
-        check("la ficha país responde con 2 departamentos y 40 municipios",
-              fp_["encontrado"] and fp_["departamentos"] == 2 and fp_["municipios"] == 40)
+        check("la ficha país responde con 2 departamentos y 40 municipios (la fila NACIONAL no cuenta)",
+              fp_["encontrado"] and fp_["departamentos"] == 2 and fp_["municipios"] == 40, (fp_.get("departamentos"), fp_.get("municipios")))
+        check("la cobertura nacional cae dentro del rango de los municipios reales",
+              fm["cobertura_neta"].min() <= fp_["indicadores"]["cobertura_neta"] <= fm["cobertura_neta"].max(), fp_["indicadores"]["cobertura_neta"])
+        check("«NACIONAL» no aparece como departamento",
+              "NACIONAL" not in {d["departamento"] for d in llamar(S.listar_departamentos)["departamentos"]})
         check("los habitantes del país son la suma de todos", fp_["poblacion"]["habitantes"] == int(fm["poblacion_total"].sum()))
         check("una fila por departamento para el mapa, con su código",
               len(fp_["departamentos_detalle"]) == 2 and {x["cod_departamento"] for x in fp_["departamentos_detalle"]} == {"05", "25"})

@@ -220,6 +220,18 @@ _token_nacional: str = ""
 # Infraestructura
 # --------------------------------------------------------------------------- #
 
+# El MEN publica, junto a los 1.122 municipios, una fila «NACIONAL» con código
+# de departamento 00 y la población escolar del país entero. Como municipio es
+# un fantasma: sin coordenadas, sin sedes, con una cobertura que no es
+# porcentaje. Y como peso en un promedio ponderado es una bomba: el 20/09/2026
+# la cobertura nacional salió en 44,5 % porque esa fila, con la población de
+# todo el país y «0,9» de cobertura, pesaba más que los 1.122 municipios juntos.
+# Se filtra al cargar, para que ninguna herramienta la vea.
+FILTROS_VISTA = {
+    "fichas_mun": "WHERE cod_departamento <> '00' AND strip_accents(upper(municipio)) <> 'NACIONAL'",
+    "men": "WHERE cod_departamento <> '00' AND strip_accents(upper(municipio)) <> 'NACIONAL'",
+}
+
 VISTAS = [
     ("fichas_mun", "fichas_municipio.parquet"),
     ("fichas_sede", "fichas_sede.parquet"),
@@ -241,7 +253,8 @@ def conexion() -> duckdb.DuckDBPyConnection:
         for vista, archivo in VISTAS:
             ruta = _datos / archivo
             if ruta.exists():
-                _con.execute(f"CREATE VIEW {vista} AS SELECT * FROM read_parquet('{ruta}')")
+                filtro = FILTROS_VISTA.get(vista, "")
+                _con.execute(f"CREATE VIEW {vista} AS SELECT * FROM read_parquet('{ruta}') {filtro}")
                 # Los códigos DANE se rellenan aquí también, no solo en la
                 # ingesta: el MEN publica el mismo municipio como "5002" y
                 # "05002" según el año, y un código sin rellenar no cruza con
@@ -254,8 +267,8 @@ def conexion() -> duckdb.DuckDBPyConnection:
                                          for c, n in anchos.items())
                     _con.execute(
                         f"CREATE OR REPLACE VIEW {vista} AS "
-                        f"SELECT * EXCLUDE ({', '.join(anchos)}), {rellenos} "
-                        f"FROM read_parquet('{ruta}')"
+                        f"SELECT * FROM (SELECT * EXCLUDE ({', '.join(anchos)}), {rellenos} "
+                        f"FROM read_parquet('{ruta}')) {filtro}"
                     )
                 LOG.info("Vista %s lista desde %s", vista, archivo)
             else:
